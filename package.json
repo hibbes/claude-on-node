@@ -1,0 +1,16 @@
+{
+  "name": "claude-code-node",
+  "version": "2.1.128",
+  "type": "commonjs",
+  "private": true,
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "node-fetch": "^2.7.0",
+    "node-pty": "^1.1.0",
+    "semver": "^7.7.4",
+    "undici": "^6.19.8",
+    "ws": "^8.18.0",
+    "yaml": "^2.5.1"
+  }
+}

@@ -1,0 +1,6 @@
+bundle.js
+bundle.js.v*.bak
+node_modules/
+*.tgz
+.env
+.env.*
