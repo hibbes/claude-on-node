@@ -39,13 +39,25 @@ warn() { printf '\033[1;33m[claude-node-update]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[claude-node-update]\033[0m %s\n' "$*" >&2; exit 1; }
 
 smoke_test() {
-    # Boot claude-node and ask for --version. If it SIGILLs or throws, fail.
+    # Two probes: --version is cheap, --help exercises ANSI text formatting
+    # (Bun.stringWidth, wrapAnsi, stripANSI) — the v128 release added unguarded
+    # call sites for those, and a --version-only smoke test let it through.
     local out
     if ! out="$(timeout 30 claude-node --version 2>&1)"; then
-        warn "Smoke test output: $out"
+        warn "Smoke test (--version) failed: $out"
         return 1
     fi
-    log "  Smoke test output: $out"
+    log "  --version: $out"
+    if ! out="$(timeout 30 claude-node --help 2>&1)"; then
+        warn "Smoke test (--help) failed: $out"
+        return 1
+    fi
+    if ! grep -q 'Usage:' <<<"$out"; then
+        warn "Smoke test (--help) produced no 'Usage:' line — bundle likely broken"
+        warn "Output head: $(head -c 400 <<<"$out")"
+        return 1
+    fi
+    log "  --help: ok ($(wc -l <<<"$out") lines)"
     return 0
 }
 
@@ -205,62 +217,57 @@ log "  ✓ dep audit clean"
 
 log "Unguarded Bun.* call-site audit…"
 # For every Bun.<symbol> occurrence, look at a ±200-char window around it for
-# a guard (typeof Bun, typeof globalThis.Bun, Bun?.). Flag a symbol only if
-# *no* occurrence is guarded. Symbols already audited manually live in
-# KNOWN_BUN and are skipped.
-KNOWN_BUN=(
-    Bun.spawn Bun.listen Bun.Transpiler
-    # Audited 2026-04-22 (v2.1.117): all guarded via typeof / typeof globalThis.Bun.
-    Bun.gc Bun.JSONL Bun.stringWidth Bun.which
-    Bun.embeddedFiles Bun.hash Bun.stripANSI Bun.wrapAnsi
-    # Support call-sites referenced inside the same guarded branches.
-    Bun.generateHeapSnapshot
-    # Audited 2026-05-05 (v2.1.128): shimmed in launcher.js via source-replace.
-    #   Bun.YAML.*    -> yaml package
-    #   Bun.semver.*  -> semver package
-    #   Bun.Terminal + Bun.spawn(opts.terminal) -> node-pty
-    # Bundle wraps Terminal+spawn in try{}, so missing shim degrades to
-    # spawnPty=undefined and a clean "Bun.Terminal unavailable" error.
-    Bun.YAML Bun.semver Bun.Terminal
+# a guard (typeof Bun, typeof globalThis.Bun). Flag a symbol if *any* occurrence
+# is unguarded — even one direct call (e.g. `function w8(H){return Bun.X(H)}`)
+# is enough to throw ReferenceError under Node, regardless of how many other
+# sites are well-guarded. v128 broke the previous "any guarded → safe" heuristic
+# by inlining minifier-extracted thunks for symbols already in SHIMMED_BUN, so
+# we now classify each site individually and rely solely on launcher.js's
+# source-replace to redirect them.
+#
+# SHIMMED_BUN must stay in lockstep with launcher.js's source-replace regex
+# (the alternation in `src.replace(/Bun\.(...)\b/g, '__bunShim.$1')`).
+SHIMMED_BUN=(
+    # Real Node-equivalent implementations:
+    Bun.YAML Bun.semver Bun.Terminal Bun.spawn
+    Bun.stringWidth Bun.stripANSI Bun.wrapAnsi Bun.which Bun.hash
+    # Inert under Node (no-op / empty / undefined):
+    Bun.gc Bun.embeddedFiles Bun.JSONL
+    # Throws on first use (rare paths: REPL, heap-dump, bg-pty TCP host):
+    Bun.generateHeapSnapshot Bun.Transpiler Bun.listen
 )
 mapfile -t BUN_HITS < <(
 python3 - <<'PY'
 import re
 src = open('bundle.js').read()
-guard_re = re.compile(r'typeof\s+(?:globalThis\.)?Bun|Bun\?\.')
+guard_re = re.compile(r'typeof\s+(?:globalThis\.)?Bun')
 sym_re = re.compile(r'Bun\.[A-Za-z_]+')
 flagged = set()
-by_sym = {}
 for m in sym_re.finditer(src):
-    by_sym.setdefault(m.group(0), []).append(m.start())
-for sym, positions in by_sym.items():
-    any_guarded = False
-    for pos in positions:
-        window = src[max(0, pos-200):pos+200]
-        if guard_re.search(window):
-            any_guarded = True
-            break
-    if not any_guarded:
-        flagged.add(sym)
+    pos = m.start()
+    window = src[max(0, pos-200):pos+200]
+    if not guard_re.search(window):
+        flagged.add(m.group(0))
 for s in sorted(flagged):
     print(s)
 PY
 )
 NEW_BUN=()
 for h in "${BUN_HITS[@]}"; do
-    if ! printf '%s\n' "${KNOWN_BUN[@]}" | grep -qxF "$h"; then
+    if ! printf '%s\n' "${SHIMMED_BUN[@]}" | grep -qxF "$h"; then
         NEW_BUN+=("$h")
     fi
 done
 if [[ ${#NEW_BUN[@]} -gt 0 ]]; then
     warn "NEW unguarded Bun.* call sites: ${NEW_BUN[*]}"
-    warn "These may need shims in launcher.js. Check ungeguardete-Bun-Calls section in memory."
+    warn "Add shims in launcher.js (globalThis.__bunShim + source-replace regex)"
+    warn "and extend SHIMMED_BUN here in lockstep, then re-run."
     if [[ "$FORCE" -eq 0 ]]; then
         die "Investigate, add shims if needed, then re-run with --force"
     fi
     warn "Continuing because --force was passed."
 fi
-log "  ✓ Bun audit clean (known: ${KNOWN_BUN[*]})"
+log "  ✓ Bun audit clean (shimmed: ${SHIMMED_BUN[*]})"
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
     log "✅ Dry-run complete — all audits passed for v${VERSION}. No changes made."

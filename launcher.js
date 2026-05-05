@@ -18,21 +18,41 @@ const bundlePath = path.join(__dirname, 'bundle.js');
 let src = fs.readFileSync(bundlePath, 'utf8');
 
 // --- Bun shim ---------------------------------------------------------------
-// The bundle has unguarded Bun.* call sites that aren't inside `typeof Bun<"u"`
-// branches. Defining globalThis.Bun is not viable: it would flip ~20 existing
+// v128 inlined a wave of `function w8(H){return Bun.X(H,...)}` minifier-extracted
+// thunks with NO `typeof Bun` guard. They throw ReferenceError under Node the
+// moment any caller dereferences them. Earlier releases routed everything
+// through guarded init expressions, so the v126-era allowlist wrongly assumed
+// "any guarded site → safe to skip"; v128 broke that assumption.
+//
+// Defining globalThis.Bun is not viable: it would flip ~20 existing
 // `typeof Bun<"u"` guards from false to true and break their Node fallbacks.
-// Instead we source-replace just the four affected symbols and route them to
-// Node-equivalent implementations:
+// Instead we source-replace every Bun.<symbol> we shim and route them to
+// Node-equivalent implementations. Strategy by symbol:
 //
-//   Bun.YAML.{parse,stringify}    -> yaml package
-//   Bun.semver.{order,satisfies}  -> semver package
-//   Bun.Terminal + Bun.spawn(opts.terminal:T) -> node-pty
+//   Real impl (npm/built-in):
+//     Bun.YAML.{parse,stringify}    -> yaml package
+//     Bun.semver.{order,satisfies}  -> semver package
+//     Bun.Terminal + Bun.spawn(opts.terminal:T) -> node-pty
+//     Bun.stringWidth               -> string-width@4
+//     Bun.stripANSI                 -> strip-ansi@6
+//     Bun.wrapAnsi                  -> wrap-ansi@7
+//     Bun.which                     -> which@3
+//     Bun.hash                      -> 64-bit FNV-1a (BigInt; matches .toString() shape)
 //
-// Other Bun.spawn call sites in the bundle live inside typeof-Bun guards, so
-// under Node those branches never execute and the rename is harmless.
+//   Inert / disabled (Node code path doesn't depend on these):
+//     Bun.gc                        -> no-op
+//     Bun.embeddedFiles             -> [] (mz() returns false → embedded mode off)
+//     Bun.JSONL                     -> undefined (Bun.JSONL?.parseChunk → undefined)
+//
+//   Throws on first use (rare paths: REPL, heap-dump, bg-pty TCP host):
+//     Bun.generateHeapSnapshot, Bun.Transpiler, Bun.listen
 const bundleRequire = Module.createRequire(bundlePath);
 const yamlMod = bundleRequire('yaml');
 const semverMod = bundleRequire('semver');
+const stringWidthMod = bundleRequire('string-width');
+const stripAnsiMod = bundleRequire('strip-ansi');
+const wrapAnsiMod = bundleRequire('wrap-ansi');
+const whichMod = bundleRequire('which');
 
 const signalNumberToName = (n) => {
   if (n == null) return undefined;
@@ -114,6 +134,27 @@ const _bunShim_spawn = (argv, opts = {}) => {
   throw new Error('Bun.spawn called under Node without PTY shim (unexpected non-PTY call site)');
 };
 
+// FNV-1a 64-bit. Matches Bun.hash's "numeric value with .toString()" surface
+// used by the bundle for cache-key derivation. Stable + deterministic, that's all
+// the bundle needs — exact algorithm parity with Wyhash isn't observable.
+const _FNV_PRIME = 0x100000001b3n;
+const _FNV_OFFSET = 0xcbf29ce484222325n;
+const _bunShim_hash = (input, seed) => {
+  let h;
+  if (seed === undefined) h = _FNV_OFFSET;
+  else if (typeof seed === 'bigint') h = BigInt.asUintN(64, seed);
+  else h = BigInt.asUintN(64, BigInt(seed));
+  let buf;
+  if (typeof input === 'string') buf = Buffer.from(input, 'utf8');
+  else if (Buffer.isBuffer(input)) buf = input;
+  else if (input instanceof Uint8Array) buf = Buffer.from(input.buffer, input.byteOffset, input.byteLength);
+  else buf = Buffer.from(String(input), 'utf8');
+  for (let i = 0; i < buf.length; i++) {
+    h = BigInt.asUintN(64, (h ^ BigInt(buf[i])) * _FNV_PRIME);
+  }
+  return h;
+};
+
 globalThis.__bunShim = {
   YAML: {
     parse: (s) => yamlMod.parse(s),
@@ -127,13 +168,38 @@ globalThis.__bunShim = {
   },
   Terminal: _BunTerminalShim,
   spawn: _bunShim_spawn,
+
+  stringWidth: (s, opts) => stringWidthMod(String(s ?? ''), opts),
+  stripANSI: (s) => stripAnsiMod(String(s ?? '')),
+  wrapAnsi: (s, cols, opts) => wrapAnsiMod(String(s ?? ''), Number(cols) || 80, opts),
+  which: (cmd, opts) => {
+    try { return whichMod.sync(String(cmd), { nothrow: true, ...(opts || {}) }); }
+    catch (_) { return null; }
+  },
+  hash: _bunShim_hash,
+
+  gc: () => {},
+  embeddedFiles: [],
+  JSONL: undefined,
+
+  generateHeapSnapshot: () => {
+    throw new Error('Bun.generateHeapSnapshot not supported under Node');
+  },
+  Transpiler: class {
+    constructor() {
+      throw new Error('Bun.Transpiler not supported under Node');
+    }
+  },
+  listen: () => {
+    throw new Error('Bun.listen not supported under Node');
+  },
 };
 
-// Source-replace just the four targeted symbols. Lookbehind ensures we don't
-// accidentally rewrite identifiers ending in "Bun" (none in the bundle today,
-// but cheap insurance against future minifier collisions).
+// Source-replace every shimmed symbol. Lookbehind ensures we don't accidentally
+// rewrite identifiers ending in "Bun" (none in the bundle today, but cheap
+// insurance against future minifier collisions).
 src = src.replace(
-  /(?<![A-Za-z0-9_$])Bun\.(YAML|semver|Terminal|spawn)\b/g,
+  /(?<![A-Za-z0-9_$])Bun\.(YAML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|gc|embeddedFiles|JSONL|generateHeapSnapshot|Transpiler|listen)\b/g,
   '__bunShim.$1',
 );
 

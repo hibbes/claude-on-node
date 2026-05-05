@@ -9,7 +9,11 @@
     "node-fetch": "^2.7.0",
     "node-pty": "^1.1.0",
     "semver": "^7.7.4",
+    "string-width": "^4.2.3",
+    "strip-ansi": "^6.0.1",
     "undici": "^6.19.8",
+    "which": "^3.0.1",
+    "wrap-ansi": "^7.0.0",
     "ws": "^8.18.0",
     "yaml": "^2.5.1"
   }
