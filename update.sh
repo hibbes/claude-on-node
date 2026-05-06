@@ -34,27 +34,52 @@ for arg in "$@"; do
     esac
 done
 
-log()  { printf '\033[1;34m[claude-node-update]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[claude-node-update]\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[1;31m[claude-node-update]\033[0m %s\n' "$*" >&2; exit 1; }
+# Per-run log file. Without this, auto-rollback's stderr scrolls past in the
+# terminal and a regression like v129's transient smoke-test failure leaves no
+# forensic trail. We tee stdout+stderr through a log file kept alongside the
+# bundle backups, rotated to the last 20 runs.
+LOG_DIR="${CLAUDE_NODE_DIR}/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/update-$(date +%Y%m%d-%H%M%S)-$$.log"
+# Wrap in subshell + || true — under `set -o pipefail` an empty glob would make
+# `ls` exit 2 and abort the whole script before the log even gets written.
+(ls -1t "$LOG_DIR"/update-*.log 2>/dev/null | tail -n +21 | xargs -r rm -f) || true
+ln -sfn "$(basename "$LOG_FILE")" "$LOG_DIR/latest.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+printf '=== claude-node-update run %s (pid %s, args: %s) ===\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$$" "$*"
+
+log()  { printf '\033[1;34m[claude-node-update %s]\033[0m %s\n' "$(date '+%H:%M:%S')" "$*"; }
+warn() { printf '\033[1;33m[claude-node-update %s]\033[0m %s\n' "$(date '+%H:%M:%S')" "$*" >&2; }
+die()  {
+    printf '\033[1;31m[claude-node-update %s]\033[0m %s\n' "$(date '+%H:%M:%S')" "$*" >&2
+    printf '\033[1;31m[claude-node-update]\033[0m Full log: %s\n' "$LOG_FILE" >&2
+    exit 1
+}
 
 smoke_test() {
     # Two probes: --version is cheap, --help exercises ANSI text formatting
     # (Bun.stringWidth, wrapAnsi, stripANSI) — the v128 release added unguarded
     # call sites for those, and a --version-only smoke test let it through.
-    local out
-    if ! out="$(timeout 30 claude-node --version 2>&1)"; then
-        warn "Smoke test (--version) failed: $out"
+    # On failure we dump the FULL output (not a head -c 400 slice) into the log
+    # so post-mortem after auto-rollback isn't a guessing game.
+    local out rc
+    set +e; out="$(timeout 30 claude-node --version 2>&1)"; rc=$?; set -e
+    if [[ $rc -ne 0 ]]; then
+        warn "Smoke test (--version) failed (exit $rc)"
+        printf '=== BEGIN --version OUTPUT ===\n%s\n=== END --version OUTPUT ===\n' "$out" >&2
         return 1
     fi
     log "  --version: $out"
-    if ! out="$(timeout 30 claude-node --help 2>&1)"; then
-        warn "Smoke test (--help) failed: $out"
+    set +e; out="$(timeout 30 claude-node --help 2>&1)"; rc=$?; set -e
+    if [[ $rc -ne 0 ]]; then
+        warn "Smoke test (--help) failed (exit $rc)"
+        printf '=== BEGIN --help OUTPUT ===\n%s\n=== END --help OUTPUT ===\n' "$out" >&2
         return 1
     fi
     if ! grep -q 'Usage:' <<<"$out"; then
         warn "Smoke test (--help) produced no 'Usage:' line — bundle likely broken"
-        warn "Output head: $(head -c 400 <<<"$out")"
+        printf '=== BEGIN --help OUTPUT ===\n%s\n=== END --help OUTPUT ===\n' "$out" >&2
         return 1
     fi
     log "  --help: ok ($(wc -l <<<"$out") lines)"
@@ -307,3 +332,4 @@ fi
 log "✅ Updated $CURRENT → $VERSION"
 log "   Backup: $CLAUDE_NODE_DIR/bundle.js.v${CURRENT}.bak"
 log "   Rollback: claude-node-update --rollback"
+log "   Log: $LOG_FILE"
