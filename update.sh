@@ -71,19 +71,28 @@ smoke_test() {
         return 1
     fi
     log "  --version: $out"
-    set +e; out="$(timeout 30 claude-node --help 2>&1)"; rc=$?; set -e
-    if [[ $rc -ne 0 ]]; then
-        warn "Smoke test (--help) failed (exit $rc)"
-        printf '=== BEGIN --help OUTPUT ===\n%s\n=== END --help OUTPUT ===\n' "$out" >&2
-        return 1
-    fi
-    if ! grep -q 'Usage:' <<<"$out"; then
-        warn "Smoke test (--help) produced no 'Usage:' line — bundle likely broken"
-        printf '=== BEGIN --help OUTPUT ===\n%s\n=== END --help OUTPUT ===\n' "$out" >&2
-        return 1
-    fi
-    log "  --help: ok ($(wc -l <<<"$out") lines)"
-    return 0
+
+    # --help reads the 14 MB bundle into Node's eval and walks Commander's whole
+    # option tree (each option goes through Bun.stringWidth/wrapAnsi). On the
+    # 2026-05-08 v136 deploy the post-write page cache was cold and the 30 s
+    # timeout fired at exactly the wrong moment; a manual re-run 9 min later
+    # finished in 4 s. Retry once with a longer budget so a transient I/O spike
+    # doesn't auto-rollback a healthy update; a real regression will fail both.
+    local attempt tmo
+    for attempt in 1 2; do
+        tmo=$(( attempt == 1 ? 30 : 90 ))
+        set +e; out="$(timeout "$tmo" claude-node --help 2>&1)"; rc=$?; set -e
+        if [[ $rc -eq 0 ]] && grep -q 'Usage:' <<<"$out"; then
+            log "  --help: ok ($(wc -l <<<"$out") lines, attempt ${attempt}/2)"
+            return 0
+        fi
+        if [[ $attempt -eq 1 ]]; then
+            warn "Smoke test (--help) attempt 1/2 failed (exit $rc); retrying with 90 s budget"
+        fi
+    done
+    warn "Smoke test (--help) failed both attempts (last exit $rc)"
+    printf '=== BEGIN --help OUTPUT (attempt 2) ===\n%s\n=== END --help OUTPUT ===\n' "$out" >&2
+    return 1
 }
 
 list_backups() {
