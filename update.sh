@@ -165,17 +165,26 @@ objcopy --dump-section .bun=claude.bun package/claude 2>/dev/null \
     || die "objcopy failed (is it a Bun SFE?)"
 [[ -s claude.bun ]] || die "claude.bun is empty"
 
-log "Extracting JS bundle from offset 0x1b0…"
+log "Extracting JS bundle (anchored to cli.js header)…"
+# Pre-2.1.133 the cli.js bundle sat at fixed offset 0x1b0 in the .bun section.
+# v2.1.133 prepends ~111 MB of precompiled bytecode and packs extra worker
+# bundles (image-processor.js, audio-capture.js) into the same section, so the
+# offset now floats. Anchor on the bunfs path immediately followed by the
+# `// @bun` header — the worker bundles carry the same `// @bun` marker but
+# different path prefixes, so the path is what disambiguates.
 python3 - <<'PY'
 data = open('claude.bun', 'rb').read()
-start = 0x1b0
-if start >= len(data):
-    raise SystemExit(f"bundle too short: {len(data)} bytes")
+prefix = b'/$bunfs/root/src/entrypoints/cli.js\x00'
+i = data.find(prefix + b'// @bun')
+if i == -1:
+    raise SystemExit("cli.js bundle marker not found in .bun section "
+                     "(expected '/$bunfs/root/src/entrypoints/cli.js\\0// @bun')")
+start = i + len(prefix)
 end = start
 while end < len(data) and (32 <= data[end] <= 126 or data[end] in (9, 10, 13)):
     end += 1
 open('bundle.js', 'wb').write(data[start:end])
-print(f"extracted {end - start} bytes")
+print(f"extracted {end - start} bytes (start at 0x{start:x})")
 PY
 [[ -s bundle.js ]] || die "bundle.js is empty"
 
