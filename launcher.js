@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Run Claude Code 2.1.137's JS bundle under Node (no Bun needed).
+// Run Claude Code 2.1.138's JS bundle under Node (no Bun needed).
 // The bundle is a CJS IIFE expression: (function(exports,require,module,__filename,__dirname){...})
 // Node doesn't auto-invoke it, so we read + eval + call with module context.
 

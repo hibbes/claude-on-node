@@ -78,16 +78,20 @@ smoke_test() {
     # call sites for those, and a --version-only smoke test let it through.
     # On failure we dump the FULL output (not a head -c 400 slice) into the log
     # so post-mortem after auto-rollback isn't a guessing game.
-
-    # Pre-warm the page cache. The freshly-written bundle.js is technically in
-    # the writeback cache, but on Core2Duo with concurrent I/O (cron jobs,
-    # gentoo emerge, restic) the first claude-node invocation can stall on
-    # page faults for >2 min. Reading the file sequentially primes the cache
-    # cheaply and removes the largest source of timeout variance.
+    #
+    # IMPORTANT: redirect stdin to /dev/null on every claude-node invocation.
+    # The bundle has 15× process.stdin.isTTY checks + 6× setRawMode + 11×
+    # stdin.on() listeners. When the updater is launched from a real terminal
+    # (anything with a TTY on stdin), the bundle's startup hooks register stdin
+    # listeners that keep the event loop alive past process.exit(), even on
+    # the --help path that should print and quit. Result: --help hangs until
+    # SIGTERM. Earlier "cold page cache" / "concurrent I/O" hypotheses were
+    # wrong; the failures were 100 % reproducible with a TTY stdin and 0 % with
+    # /dev/null stdin. The pre-warm cat below is harmless on Core2Duo and stays.
     cat "$CLAUDE_NODE_DIR/bundle.js" > /dev/null 2>&1 || true
 
     local out rc
-    set +e; out="$(timeout 30 claude-node --version 2>&1)"; rc=$?; set -e
+    set +e; out="$(timeout 30 claude-node --version </dev/null 2>&1)"; rc=$?; set -e
     if [[ $rc -ne 0 ]]; then
         warn "Smoke test (--version) failed (exit $rc)"
         printf '=== BEGIN --version OUTPUT ===\n%s\n=== END --version OUTPUT ===\n' "$out" >&2
@@ -97,23 +101,20 @@ smoke_test() {
     log "  --version: $out"
 
     # --help reads the 14 MB bundle into Node's eval and walks Commander's whole
-    # option tree (each option goes through Bun.stringWidth/wrapAnsi). On the
-    # 2026-05-08 v136 deploy the post-write page cache was cold and the 30 s
-    # timeout fired at exactly the wrong moment; a manual re-run 9 min later
-    # finished in 4 s. The 2026-05-09 v137 deploy then hung BOTH 30s and 90s
-    # attempts — manual retry 4 min later succeeded in 2 s. Pre-warm above
-    # should kill the cold-cache class entirely; the 240 s second attempt
-    # absorbs anything else short of a real regression.
+    # option tree (each option goes through Bun.stringWidth/wrapAnsi). With the
+    # </dev/null fix above this lands in ~4 s on this hardware; the 30 s first
+    # budget plus 90 s retry are kept as belt-and-suspenders for unexpected
+    # I/O contention, not for the (now-fixed) TTY hang.
     local attempt tmo
     for attempt in 1 2; do
-        tmo=$(( attempt == 1 ? 30 : 240 ))
-        set +e; out="$(timeout "$tmo" claude-node --help 2>&1)"; rc=$?; set -e
+        tmo=$(( attempt == 1 ? 30 : 90 ))
+        set +e; out="$(timeout "$tmo" claude-node --help </dev/null 2>&1)"; rc=$?; set -e
         if [[ $rc -eq 0 ]] && grep -q 'Usage:' <<<"$out"; then
             log "  --help: ok ($(wc -l <<<"$out") lines, attempt ${attempt}/2)"
             return 0
         fi
         if [[ $attempt -eq 1 ]]; then
-            warn "Smoke test (--help) attempt 1/2 failed (exit $rc); retrying with 240 s budget"
+            warn "Smoke test (--help) attempt 1/2 failed (exit $rc); retrying with 90 s budget"
             dump_forensics
         fi
     done
