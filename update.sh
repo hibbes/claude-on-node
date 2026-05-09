@@ -57,17 +57,41 @@ die()  {
     exit 1
 }
 
+dump_forensics() {
+    # Capture system state on smoke-test failure. Previous post-mortems (v136
+    # 2026-05-08, v137 2026-05-09) were guessing games because the log only
+    # showed exit 124. With this we'll know if it was I/O contention, swap
+    # thrash, or an actual regression.
+    {
+        printf '=== forensics @ %s ===\n' "$(date '+%H:%M:%S')"
+        printf 'loadavg: %s\n' "$(cut -d' ' -f1-3 /proc/loadavg)"
+        printf 'memory:\n'; free -h | sed 's/^/  /'
+        printf 'top cpu:\n'
+        ps -eo pcpu,pmem,rss,etime,comm --sort=-pcpu --no-headers \
+            | head -5 | sed 's/^/  /'
+    } >&2
+}
+
 smoke_test() {
     # Two probes: --version is cheap, --help exercises ANSI text formatting
     # (Bun.stringWidth, wrapAnsi, stripANSI) — the v128 release added unguarded
     # call sites for those, and a --version-only smoke test let it through.
     # On failure we dump the FULL output (not a head -c 400 slice) into the log
     # so post-mortem after auto-rollback isn't a guessing game.
+
+    # Pre-warm the page cache. The freshly-written bundle.js is technically in
+    # the writeback cache, but on Core2Duo with concurrent I/O (cron jobs,
+    # gentoo emerge, restic) the first claude-node invocation can stall on
+    # page faults for >2 min. Reading the file sequentially primes the cache
+    # cheaply and removes the largest source of timeout variance.
+    cat "$CLAUDE_NODE_DIR/bundle.js" > /dev/null 2>&1 || true
+
     local out rc
     set +e; out="$(timeout 30 claude-node --version 2>&1)"; rc=$?; set -e
     if [[ $rc -ne 0 ]]; then
         warn "Smoke test (--version) failed (exit $rc)"
         printf '=== BEGIN --version OUTPUT ===\n%s\n=== END --version OUTPUT ===\n' "$out" >&2
+        dump_forensics
         return 1
     fi
     log "  --version: $out"
@@ -76,22 +100,26 @@ smoke_test() {
     # option tree (each option goes through Bun.stringWidth/wrapAnsi). On the
     # 2026-05-08 v136 deploy the post-write page cache was cold and the 30 s
     # timeout fired at exactly the wrong moment; a manual re-run 9 min later
-    # finished in 4 s. Retry once with a longer budget so a transient I/O spike
-    # doesn't auto-rollback a healthy update; a real regression will fail both.
+    # finished in 4 s. The 2026-05-09 v137 deploy then hung BOTH 30s and 90s
+    # attempts — manual retry 4 min later succeeded in 2 s. Pre-warm above
+    # should kill the cold-cache class entirely; the 240 s second attempt
+    # absorbs anything else short of a real regression.
     local attempt tmo
     for attempt in 1 2; do
-        tmo=$(( attempt == 1 ? 30 : 90 ))
+        tmo=$(( attempt == 1 ? 30 : 240 ))
         set +e; out="$(timeout "$tmo" claude-node --help 2>&1)"; rc=$?; set -e
         if [[ $rc -eq 0 ]] && grep -q 'Usage:' <<<"$out"; then
             log "  --help: ok ($(wc -l <<<"$out") lines, attempt ${attempt}/2)"
             return 0
         fi
         if [[ $attempt -eq 1 ]]; then
-            warn "Smoke test (--help) attempt 1/2 failed (exit $rc); retrying with 90 s budget"
+            warn "Smoke test (--help) attempt 1/2 failed (exit $rc); retrying with 240 s budget"
+            dump_forensics
         fi
     done
     warn "Smoke test (--help) failed both attempts (last exit $rc)"
     printf '=== BEGIN --help OUTPUT (attempt 2) ===\n%s\n=== END --help OUTPUT ===\n' "$out" >&2
+    dump_forensics
     return 1
 }
 
