@@ -308,6 +308,21 @@ SHIMMED_BUN=(
     # Throws on first use (rare paths: REPL, heap-dump, bg-pty TCP host):
     Bun.generateHeapSnapshot Bun.Transpiler Bun.listen
 )
+
+# Bun.* symbols the regex audit sees but that are NOT executable call sites:
+# they sit inside string literals the bundle emits verbatim as file content
+# (plugin scaffolding templates), so they never run under Node. Deliberately
+# NOT shimmed — routing them through launcher.js's source-replace would rewrite
+# the emitted template text and corrupt the file a user gets when scaffolding a
+# plugin. Each entry maps the symbol to a context fingerprint (which must
+# contain the symbol exactly once); the audit below requires EVERY occurrence
+# of the symbol to sit inside that fingerprint, so a future *executable* use —
+# or just a reworded template — diverges the counts and re-trips the audit
+# instead of being silently waved through.
+#   Bun.stdin — v2.1.141, inside $p5()'s on-session-start.ts hook-handler template
+declare -A AUDIT_INERT_BUN=(
+    [Bun.stdin]='new Response(Bun.stdin.stream()).text()'
+)
 mapfile -t BUN_HITS < <(
 python3 - <<'PY'
 import re
@@ -325,11 +340,34 @@ for s in sorted(flagged):
 PY
 )
 NEW_BUN=()
+INERT_BUN=()
 for h in "${BUN_HITS[@]}"; do
-    if ! printf '%s\n' "${SHIMMED_BUN[@]}" | grep -qxF "$h"; then
-        NEW_BUN+=("$h")
+    # Already redirected by launcher.js's source-replace shim.
+    if printf '%s\n' "${SHIMMED_BUN[@]}" | grep -qxF "$h"; then
+        continue
     fi
+    # Symbol verified-inert (string-literal content only)? Accept only when
+    # EVERY occurrence sits inside its recorded context fingerprint; otherwise
+    # a new or executable use has appeared, so fall through to NEW_BUN and re-flag.
+    if [[ -n "${AUDIT_INERT_BUN[$h]+set}" ]]; then
+        fp="${AUDIT_INERT_BUN[$h]}"
+        set +e
+        sym_n=$(grep -oF -- "$h" bundle.js | wc -l)
+        fp_n=$(grep -oF -- "$fp" bundle.js | wc -l)
+        set -e
+        if [[ "$fp_n" -gt 0 && "$sym_n" -eq "$fp_n" ]]; then
+            INERT_BUN+=("$h")
+            continue
+        fi
+        warn "$h was classified inert but no longer matches its recorded context"
+        warn "  expected all ${sym_n} occurrence(s) inside: ${fp}"
+        warn "  matched ${fp_n} — inspect the bundle and update AUDIT_INERT_BUN"
+    fi
+    NEW_BUN+=("$h")
 done
+if [[ ${#INERT_BUN[@]} -gt 0 ]]; then
+    log "  note: ${INERT_BUN[*]} present only as inert string-literal content (not executed)"
+fi
 if [[ ${#NEW_BUN[@]} -gt 0 ]]; then
     warn "NEW unguarded Bun.* call sites: ${NEW_BUN[*]}"
     warn "Add shims in launcher.js (globalThis.__bunShim + source-replace regex)"
