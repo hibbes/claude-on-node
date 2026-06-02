@@ -64,7 +64,7 @@ The `package.json` deps are mostly of two kinds:
 - **Shim backers** — Node packages the loader wires into `__bunShim`: `yaml`, `semver`, `node-pty`, `string-width`, `strip-ansi`, `wrap-ansi`, `which`.
 - **The bundle's own `require()` targets** — modules the bundle imports directly under Node: `ajv` (+ `ajv-formats`), `undici`, `ws`, and — **since v2.1.160** — `react` + `react-dom` (`react-dom/client`).
 
-(`node-fetch` is a legacy dep the current bundle no longer `require()`s; kept for now, safe to drop on a future cleanup.)
+(`node-fetch` looks orphaned — the dep audit never lists it — because it's reached via a dynamic **`import("node-fetch")`**, not a static `require()`, inside the vendored `gaxios` HTTP client (Google-auth code paths). Under Node that lazy branch is the one taken (`window` is undefined), so it's a real conditional runtime dep and must stay. Pinned to v2 for CommonJS default-export compatibility. Caveat: the updater's require()-audit cannot see dynamic imports — a future bundle that adds a new `import()`-only dep would deploy without being flagged.)
 
 React is pinned to **19** (`^19.2.0`). The bundle is built against React 19, not 18 — it references React-19-only exports (`useActionState`, `useOptimistic`) and the 19-era internals symbol, and uses `createRoot` with no legacy `render`. `react` and `react-dom` must resolve to the **same** version (react-dom enforces a runtime version-match check). If a future release bumps the React major, determine it from the extracted bundle (internals symbol + hook names), don't guess.
 
