@@ -1,6 +1,6 @@
 {
   "name": "claude-code-node",
-  "version": "2.1.141",
+  "version": "2.1.160",
   "type": "commonjs",
   "private": true,
   "dependencies": {
@@ -8,6 +8,8 @@
     "ajv-formats": "^3.0.1",
     "node-fetch": "^2.7.0",
     "node-pty": "^1.1.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
     "semver": "^7.7.4",
     "string-width": "^4.2.3",
     "strip-ansi": "^6.0.1",
