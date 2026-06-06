@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Run Claude Code 2.1.160's JS bundle under Node (no Bun needed).
+// Run Claude Code 2.1.167's JS bundle under Node (no Bun needed).
 // The bundle is a CJS IIFE expression: (function(exports,require,module,__filename,__dirname){...})
 // Node doesn't auto-invoke it, so we read + eval + call with module context.
 
@@ -38,6 +38,7 @@ let src = fs.readFileSync(bundlePath, 'utf8');
 //     Bun.wrapAnsi                  -> wrap-ansi@7
 //     Bun.which                     -> which@3
 //     Bun.hash                      -> 64-bit FNV-1a (BigInt; matches .toString() shape)
+//     Bun.deepEquals                -> hand-rolled deep-equality (Bun expect().toEqual non-strict)
 //
 //   Inert / disabled (Node code path doesn't depend on these):
 //     Bun.gc                        -> no-op
@@ -155,6 +156,123 @@ const _bunShim_hash = (input, seed) => {
   return h;
 };
 
+// Bun.deepEquals(a, b, strict=false): recursive structural equality.
+// The 2.1.167 bundle's lone call site is non-strict, 2-arg — i.e. the same
+// semantics as expect().toEqual(): undefined props + trailing/undefined array
+// elements are ignored, prototypes are NOT compared, NaN===NaN. strict mode
+// (expect().toStrictEqual()) additionally requires matching prototypes, exact
+// key/length sets (undefined counts), and array sparseness. No Node built-in
+// matches non-strict mode (util.isDeepStrictEqual is strict + Object.is), so we
+// implement it directly. Spec: https://bun.com/docs/api/utils#bun-deepequals
+const _bunShim_ownKeys = (o, strict) => {
+  const keys = Object.keys(o);
+  for (const s of Object.getOwnPropertySymbols(o)) {
+    if (Object.prototype.propertyIsEnumerable.call(o, s)) keys.push(s);
+  }
+  return strict ? keys : keys.filter((k) => o[k] !== undefined);
+};
+
+const _bunShim_deepEquals = (a, b, strict = false) => {
+  if (a === b) return true; // identity / same primitive (+0===-0); NaN handled below
+
+  const ta = typeof a, tb = typeof b;
+  if (ta !== 'object' || tb !== 'object' || a === null || b === null) {
+    // at least one primitive/null — the only remaining equal case is NaN===NaN
+    if (ta === 'number' && tb === 'number') return a !== a && b !== b;
+    return false;
+  }
+
+  const sa = Object.prototype.toString.call(a);
+  const sb = Object.prototype.toString.call(b);
+  if (sa !== sb) return false;
+  if (strict && Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+
+  switch (sa) {
+    case '[object Date]': {
+      const va = a.getTime(), vb = b.getTime();
+      return va === vb || (va !== va && vb !== vb);
+    }
+    case '[object RegExp]':
+      return a.source === b.source && a.flags === b.flags;
+    case '[object Number]':
+    case '[object String]':
+    case '[object Boolean]': {
+      const va = a.valueOf(), vb = b.valueOf();
+      return va === vb || (typeof va === 'number' && va !== va && vb !== vb);
+    }
+    case '[object ArrayBuffer]': {
+      if (a.byteLength !== b.byteLength) return false;
+      const ua = new Uint8Array(a), ub = new Uint8Array(b);
+      for (let i = 0; i < ua.length; i++) if (ua[i] !== ub[i]) return false;
+      return true;
+    }
+    case '[object DataView]': {
+      if (a.byteLength !== b.byteLength) return false;
+      for (let i = 0; i < a.byteLength; i++) if (a.getUint8(i) !== b.getUint8(i)) return false;
+      return true;
+    }
+    case '[object Map]': {
+      if (a.size !== b.size) return false;
+      const bEntries = [...b], used = new Array(bEntries.length).fill(false);
+      for (const [ka, va] of a) {
+        let found = false;
+        for (let j = 0; j < bEntries.length; j++) {
+          if (used[j]) continue;
+          if (_bunShim_deepEquals(ka, bEntries[j][0], strict) &&
+              _bunShim_deepEquals(va, bEntries[j][1], strict)) { used[j] = true; found = true; break; }
+        }
+        if (!found) return false;
+      }
+      return true;
+    }
+    case '[object Set]': {
+      if (a.size !== b.size) return false;
+      const bVals = [...b], used = new Array(bVals.length).fill(false);
+      for (const va of a) {
+        let found = false;
+        for (let j = 0; j < bVals.length; j++) {
+          if (used[j]) continue;
+          if (_bunShim_deepEquals(va, bVals[j], strict)) { used[j] = true; found = true; break; }
+        }
+        if (!found) return false;
+      }
+      return true;
+    }
+  }
+
+  if (ArrayBuffer.isView(a)) { // typed arrays (DataView handled above)
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      const x = a[i], y = b[i];
+      if (x !== y && !(typeof x === 'number' && x !== x && y !== y)) return false;
+    }
+    return true;
+  }
+
+  if (Array.isArray(a)) {
+    if (!Array.isArray(b)) return false;
+    if (strict && a.length !== b.length) return false;
+    const len = a.length > b.length ? a.length : b.length;
+    for (let i = 0; i < len; i++) {
+      if (strict && (i in a) !== (i in b)) return false;
+      if (!_bunShim_deepEquals(a[i], b[i], strict)) return false;
+    }
+    return true;
+  }
+  if (Array.isArray(b)) return false;
+
+  // plain objects / class instances
+  const keysA = _bunShim_ownKeys(a, strict);
+  const keysB = _bunShim_ownKeys(b, strict);
+  if (keysA.length !== keysB.length) return false;
+  const setB = new Set(keysB);
+  for (const k of keysA) {
+    if (!setB.has(k)) return false;
+    if (!_bunShim_deepEquals(a[k], b[k], strict)) return false;
+  }
+  return true;
+};
+
 globalThis.__bunShim = {
   YAML: {
     parse: (s) => yamlMod.parse(s),
@@ -177,6 +295,7 @@ globalThis.__bunShim = {
     catch (_) { return null; }
   },
   hash: _bunShim_hash,
+  deepEquals: _bunShim_deepEquals,
 
   gc: () => {},
   embeddedFiles: [],
@@ -199,7 +318,7 @@ globalThis.__bunShim = {
 // rewrite identifiers ending in "Bun" (none in the bundle today, but cheap
 // insurance against future minifier collisions).
 src = src.replace(
-  /(?<![A-Za-z0-9_$])Bun\.(YAML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|gc|embeddedFiles|JSONL|generateHeapSnapshot|Transpiler|listen)\b/g,
+  /(?<![A-Za-z0-9_$])Bun\.(YAML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|gc|embeddedFiles|JSONL|generateHeapSnapshot|Transpiler|listen)\b/g,
   '__bunShim.$1',
 );
 
