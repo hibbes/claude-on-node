@@ -305,8 +305,8 @@ SHIMMED_BUN=(
     Bun.stringWidth Bun.stripANSI Bun.wrapAnsi Bun.which Bun.hash Bun.deepEquals
     # Inert under Node (no-op / empty / undefined):
     Bun.gc Bun.embeddedFiles Bun.JSONL
-    # Throws on first use (rare paths: REPL, heap-dump, bg-pty TCP host):
-    Bun.generateHeapSnapshot Bun.Transpiler Bun.listen
+    # Throws on first use (rare paths: REPL, heap-dump, bg-pty TCP host, gateway):
+    Bun.generateHeapSnapshot Bun.Transpiler Bun.listen Bun.serve
 )
 
 # Bun.* symbols the regex audit sees but that are NOT executable call sites:

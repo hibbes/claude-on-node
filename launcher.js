@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Run Claude Code 2.1.167's JS bundle under Node (no Bun needed).
+// Run Claude Code 2.1.195's JS bundle under Node (no Bun needed).
 // The bundle is a CJS IIFE expression: (function(exports,require,module,__filename,__dirname){...})
 // Node doesn't auto-invoke it, so we read + eval + call with module context.
 
@@ -45,8 +45,8 @@ let src = fs.readFileSync(bundlePath, 'utf8');
 //     Bun.embeddedFiles             -> [] (mz() returns false → embedded mode off)
 //     Bun.JSONL                     -> undefined (Bun.JSONL?.parseChunk → undefined)
 //
-//   Throws on first use (rare paths: REPL, heap-dump, bg-pty TCP host):
-//     Bun.generateHeapSnapshot, Bun.Transpiler, Bun.listen
+//   Throws on first use (rare paths: REPL, heap-dump, bg-pty TCP host, gateway):
+//     Bun.generateHeapSnapshot, Bun.Transpiler, Bun.listen, Bun.serve
 const bundleRequire = Module.createRequire(bundlePath);
 const yamlMod = bundleRequire('yaml');
 const semverMod = bundleRequire('semver');
@@ -312,13 +312,20 @@ globalThis.__bunShim = {
   listen: () => {
     throw new Error('Bun.listen not supported under Node');
   },
+  serve: () => {
+    // claude gateway HTTP server (Bun.serve, /v1/messages proxy). Native-binary
+    // only: the same subsystem's Bun.SQL site is gated in-bundle behind a
+    // `typeof Bun>"u" -> throw "claude gateway requires the native binary"`
+    // check, so this path is never reached in normal CLI use.
+    throw new Error('Bun.serve not supported under Node (claude gateway requires the native binary)');
+  },
 };
 
 // Source-replace every shimmed symbol. Lookbehind ensures we don't accidentally
 // rewrite identifiers ending in "Bun" (none in the bundle today, but cheap
 // insurance against future minifier collisions).
 src = src.replace(
-  /(?<![A-Za-z0-9_$])Bun\.(YAML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|gc|embeddedFiles|JSONL|generateHeapSnapshot|Transpiler|listen)\b/g,
+  /(?<![A-Za-z0-9_$])Bun\.(YAML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|gc|embeddedFiles|JSONL|generateHeapSnapshot|Transpiler|listen|serve)\b/g,
   '__bunShim.$1',
 );
 
