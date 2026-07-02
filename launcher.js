@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Run Claude Code 2.1.195's JS bundle under Node (no Bun needed).
+// Run Claude Code 2.1.198's JS bundle under Node (no Bun needed).
 // The bundle is a CJS IIFE expression: (function(exports,require,module,__filename,__dirname){...})
 // Node doesn't auto-invoke it, so we read + eval + call with module context.
 
@@ -44,6 +44,7 @@ let src = fs.readFileSync(bundlePath, 'utf8');
 //     Bun.gc                        -> no-op
 //     Bun.embeddedFiles             -> [] (mz() returns false → embedded mode off)
 //     Bun.JSONL                     -> undefined (Bun.JSONL?.parseChunk → undefined)
+//     Bun.isStandaloneExecutable    -> false (running under Node, not a compiled Bun SFE)
 //
 //   Throws on first use (rare paths: REPL, heap-dump, bg-pty TCP host, gateway):
 //     Bun.generateHeapSnapshot, Bun.Transpiler, Bun.listen, Bun.serve
@@ -300,6 +301,11 @@ globalThis.__bunShim = {
   gc: () => {},
   embeddedFiles: [],
   JSONL: undefined,
+  // Property read as `Bun.isStandaloneExecutable===!0`, NOT a function: the one
+  // 2.1.198 call site is `function rf(){return Bun.isStandaloneExecutable===!0}`.
+  // We run the extracted JS under Node, never a `bun build --compile` binary, so
+  // this is false (same rationale as embeddedFiles:[], standalone/embedded off).
+  isStandaloneExecutable: false,
 
   generateHeapSnapshot: () => {
     throw new Error('Bun.generateHeapSnapshot not supported under Node');
@@ -325,7 +331,7 @@ globalThis.__bunShim = {
 // rewrite identifiers ending in "Bun" (none in the bundle today, but cheap
 // insurance against future minifier collisions).
 src = src.replace(
-  /(?<![A-Za-z0-9_$])Bun\.(YAML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|gc|embeddedFiles|JSONL|generateHeapSnapshot|Transpiler|listen|serve)\b/g,
+  /(?<![A-Za-z0-9_$])Bun\.(YAML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve)\b/g,
   '__bunShim.$1',
 );
 
