@@ -303,6 +303,7 @@ SHIMMED_BUN=(
     # Real Node-equivalent implementations:
     Bun.YAML Bun.semver Bun.Terminal Bun.spawn
     Bun.stringWidth Bun.stripANSI Bun.wrapAnsi Bun.which Bun.hash Bun.deepEquals
+    Bun.file
     # Inert under Node (no-op / empty / undefined / false):
     Bun.gc Bun.embeddedFiles Bun.JSONL Bun.isStandaloneExecutable
     # Throws on first use (rare paths: REPL, heap-dump, bg-pty TCP host, gateway):

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Run Claude Code 2.1.198's JS bundle under Node (no Bun needed).
+// Run Claude Code 2.1.201's JS bundle under Node (no Bun needed).
 // The bundle is a CJS IIFE expression: (function(exports,require,module,__filename,__dirname){...})
 // Node doesn't auto-invoke it, so we read + eval + call with module context.
 
@@ -39,6 +39,7 @@ let src = fs.readFileSync(bundlePath, 'utf8');
 //     Bun.which                     -> which@3
 //     Bun.hash                      -> 64-bit FNV-1a (BigInt; matches .toString() shape)
 //     Bun.deepEquals                -> hand-rolled deep-equality (Bun expect().toEqual non-strict)
+//     Bun.file                      -> lazy fs-backed BunFile subset (Blob subclass)
 //
 //   Inert / disabled (Node code path doesn't depend on these):
 //     Bun.gc                        -> no-op
@@ -274,6 +275,121 @@ const _bunShim_deepEquals = (a, b, strict = false) => {
   return true;
 };
 
+// --- Bun.file shim (lazy BunFile subset backed by Node fs) -------------------
+// 2.1.201's sole call site is `Bun.file(<ptySock>.err)` as a spawn-stdio stderr
+// target in the bg-pty-host spawner (a path our non-terminal Bun.spawn shim
+// rejects anyway), so nothing consumes the object today. Still a REAL fs-backed
+// implementation rather than a throws-stub: once a symbol is in SHIMMED_BUN the
+// audit stops flagging its new call sites, and Bun.file is Bun's most central
+// file API; future releases will grow more sites (.text()/.json()/.exists()
+// reads), which should then just work under Node. Calibrated to the BunFile
+// docs (bun.com/docs/api/file-io); unverifiable against real Bun on this box
+// (Bun SIGILLs here, the reason this project exists). Unit suite:
+// bunfile-shim.test.js extracts this block by its BEGIN/END markers and evals
+// it, so the tested code is the shipped code.
+const _bunShim_fileMime = {
+  '.json': 'application/json;charset=utf-8',
+  '.txt': 'text/plain;charset=utf-8',
+  '.md': 'text/markdown;charset=utf-8',
+  '.html': 'text/html;charset=utf-8',
+  '.css': 'text/css;charset=utf-8',
+  '.js': 'text/javascript;charset=utf-8',
+  '.mjs': 'text/javascript;charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.pdf': 'application/pdf',
+  '.wasm': 'application/wasm',
+};
+
+class _BunFileShim extends Blob {
+  constructor(pathOrFd, options) {
+    super([]);
+    if (typeof pathOrFd === 'number') {
+      this._fd = pathOrFd; // no name/path: reads go through the fd
+    } else {
+      let p = pathOrFd;
+      if (p instanceof URL || (typeof p === 'string' && p.startsWith('file://'))) {
+        p = require('url').fileURLToPath(p);
+      } else if (p instanceof Uint8Array) {
+        p = Buffer.from(p.buffer, p.byteOffset, p.byteLength).toString('utf8');
+      } else if (p instanceof ArrayBuffer) {
+        p = Buffer.from(p).toString('utf8');
+      } else if (typeof p !== 'string') {
+        p = String(p);
+      }
+      this._path = p;
+      this.name = p;
+    }
+    this._type = (options && options.type)
+      || _bunShim_fileMime[path.extname(this._path || '').toLowerCase()]
+      || 'application/octet-stream';
+  }
+  get type() { return this._type; }
+  _stat() {
+    try { return this._fd !== undefined ? fs.fstatSync(this._fd) : fs.statSync(this._path); }
+    catch (_) { return null; }
+  }
+  get size() { const st = this._stat(); return st ? st.size : 0; }
+  get lastModified() { const st = this._stat(); return st ? st.mtimeMs : 0; }
+  async exists() { return this._stat() !== null; }
+  _read() {
+    if (this._fd !== undefined) {
+      // Positioned read from 0: fs.readFileSync(fd) would consume the fd's
+      // current offset and make a second read return ''.
+      const size = fs.fstatSync(this._fd).size;
+      const buf = Buffer.alloc(size);
+      fs.readSync(this._fd, buf, 0, size, 0);
+      return buf;
+    }
+    return fs.readFileSync(this._path);
+  }
+  async text() { return this._read().toString('utf8'); }
+  async json() { return JSON.parse(this._read().toString('utf8')); }
+  async bytes() { const b = this._read(); return new Uint8Array(b.buffer, b.byteOffset, b.byteLength); }
+  async arrayBuffer() { const b = this._read(); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); }
+  stream() {
+    const rs = this._fd !== undefined
+      ? fs.createReadStream(null, { fd: this._fd, start: 0, autoClose: false })
+      : fs.createReadStream(this._path);
+    return require('stream').Readable.toWeb(rs);
+  }
+  slice() {
+    // Blob.prototype.slice would silently hand back an EMPTY blob (super([])
+    // holds no data). Fail loudly; implement lazily if a bundle ever calls it.
+    throw new Error('BunFile.slice not supported under Node shim');
+  }
+  writer() {
+    const ownFd = this._fd === undefined;
+    const fd = ownFd ? fs.openSync(this._path, 'w') : this._fd;
+    let open = true;
+    return {
+      write: (chunk) => {
+        if (!open) return 0;
+        const buf = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8')
+          : Buffer.isBuffer(chunk) ? chunk
+          : ArrayBuffer.isView(chunk) ? Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+          : chunk instanceof ArrayBuffer ? Buffer.from(chunk)
+          : Buffer.from(String(chunk), 'utf8');
+        return fs.writeSync(fd, buf);
+      },
+      flush: () => 0, // write() above is synchronous and unbuffered
+      end: () => {
+        if (open && ownFd) { try { fs.closeSync(fd); } catch (_) {} }
+        open = false;
+        return 0;
+      },
+    };
+  }
+  async delete() { await fs.promises.unlink(this._path); }
+  unlink() { return this.delete(); }
+}
+const _bunShim_file = (pathOrFd, options) => new _BunFileShim(pathOrFd, options);
+// --- end Bun.file shim --------------------------------------------------------
+
 globalThis.__bunShim = {
   YAML: {
     parse: (s) => yamlMod.parse(s),
@@ -297,6 +413,7 @@ globalThis.__bunShim = {
   },
   hash: _bunShim_hash,
   deepEquals: _bunShim_deepEquals,
+  file: _bunShim_file,
 
   gc: () => {},
   embeddedFiles: [],
@@ -331,7 +448,7 @@ globalThis.__bunShim = {
 // rewrite identifiers ending in "Bun" (none in the bundle today, but cheap
 // insurance against future minifier collisions).
 src = src.replace(
-  /(?<![A-Za-z0-9_$])Bun\.(YAML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve)\b/g,
+  /(?<![A-Za-z0-9_$])Bun\.(YAML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve)\b/g,
   '__bunShim.$1',
 );
 
