@@ -218,9 +218,18 @@ if i == -1:
     raise SystemExit("cli.js bundle marker not found in .bun section "
                      "(expected '/$bunfs/root/src/entrypoints/cli.js\\0// @bun')")
 start = i + len(prefix)
-end = start
-while end < len(data) and (32 <= data[end] <= 126 or data[end] in (9, 10, 13)):
-    end += 1
+# Entries in the .bun section are NUL-separated: the cli.js payload is followed
+# by \x00 and then the next path ("\x00/$bunfs/root/image-processor.js\x00//
+# @bun"). Cut on that terminator. The previous boundary scanned forward while
+# bytes stayed printable ASCII, which lands on the same offset only because Bun
+# currently escapes non-ASCII to \uXXXX: one raw byte >= 0x80 anywhere in the
+# bundle would have cut it short there, and a truncation whose last 8 bytes
+# happen to contain "})" slips past the trailer check below (~1.6% of cut
+# points). Verified identical output on 2.1.113 / .133 / .167 / .206 / .212.
+end = data.find(b'\x00', start)
+if end == -1:
+    raise SystemExit("no NUL terminator after the cli.js bundle "
+                     "(.bun section truncated?)")
 open('bundle.js', 'wb').write(data[start:end])
 print(f"extracted {end - start} bytes (start at 0x{start:x})")
 PY
