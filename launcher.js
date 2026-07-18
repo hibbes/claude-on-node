@@ -14,6 +14,27 @@ const os = require('os');
 // triggers the system-rg lookup via `which`.
 if (process.env.USE_BUILTIN_RIPGREP === undefined) process.env.USE_BUILTIN_RIPGREP = '0';
 
+// The bundle contains `using` declarations (Explicit Resource Management).
+// V8 only parses that form from Node 24 onwards, and it is not gated to any
+// particular scope: on older Node the whole bundle fails, even though `using`
+// sits inside the wrapper function. The eval below then reports the minified
+// variable name of the first such declaration and nothing else, e.g.
+// "SyntaxError: Unexpected identifier 'K'" (issue #1). Measured against
+// bundle 2.1.212: 20.20.2, 22.23.1 and 23.11.1 all fail, 24.0.0 (V8 13.6.233.8)
+// and later parse. Note that Anthropic's own package declares node >=22.0.0,
+// which covers their native binary, not running the bundle under Node.
+const nodeMajor = Number(process.versions.node.split('.')[0]);
+if (!Number.isFinite(nodeMajor) || nodeMajor < 24) {
+  console.error(
+    `claude-on-node requires Node 24 or newer, found ${process.version}.\n` +
+    "The Claude Code bundle uses `using` declarations, which V8 does not parse\n" +
+    'before Node 24. Running it here fails with a SyntaxError naming a minified\n' +
+    'variable. Anthropic\'s own "node >=22" applies to their native binary, not\n' +
+    'to running the bundle under Node.',
+  );
+  process.exit(1);
+}
+
 const bundlePath = path.join(__dirname, 'bundle.js');
 let src = fs.readFileSync(bundlePath, 'utf8');
 

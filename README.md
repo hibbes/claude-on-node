@@ -11,6 +11,29 @@ Anthropic ships `claude` as a Bun single-file executable. The actual logic is a 
 3. **Shims** the Bun-only APIs the bundle uses (YAML, semver, PTY, ANSI text metrics, hashing, …) with Node equivalents, by source-replacing each `Bun.<symbol>` before `eval`
 4. **Audits** new releases before deploying — refuses updates that introduce unguarded `Bun.*` call sites without a known shim, or new `require()` targets that aren't declared in `package.json`
 
+## Requirements
+
+**Node 24.0.0 or newer.** The bundle contains `using` declarations (Explicit
+Resource Management), a form V8 only parses from Node 24 on. Older Node fails to
+parse the entire bundle and reports only the minified variable name of the first
+such declaration, e.g. `SyntaxError: Unexpected identifier 'K'`, with a stack
+pointing into `launcher.js` (see issue #1). Measured against bundle 2.1.212:
+
+| Node | Result |
+|------|--------|
+| 20.20.2 | fails to parse |
+| 22.23.1 | fails to parse |
+| 23.11.1 | fails to parse |
+| 24.0.0 (V8 13.6.233.8) | parses |
+| 24.18.0 | parses |
+
+Note that Anthropic's own package declares `node >=22.0.0`. That covers their
+native binary and its npm wrapper, not running the extracted bundle under Node,
+so it is not a usable floor here. `launcher.js` checks the running version and
+exits with an explanatory message rather than letting the parse fail.
+
+Also needed: `objcopy` (binutils) and `npm` for the updater.
+
 ## Layout
 
 ```
