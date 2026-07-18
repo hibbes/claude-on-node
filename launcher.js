@@ -452,6 +452,28 @@ src = src.replace(
   '__bunShim.$1',
 );
 
+// Shape check before eval. A damaged bundle fails deep inside 20 MB of
+// minified source with a message that names a minified identifier and nothing
+// else: the bundle carries ~35 `using` declarations, which are legal inside
+// the wrapper function but a SyntaxError at Script top level. So a truncated
+// or unwrapped bundle surfaces as "SyntaxError: Unexpected identifier 'K'"
+// with a stack pointing at this line and no hint about the real cause
+// (issue #1). Same head/trailer criteria update.sh applies after extraction,
+// repeated here because bundle.js can also arrive by other means.
+const head = src.slice(0, 200);
+if (!head.includes('@bun') ||
+    !/function\(exports,\s*require,\s*module/.test(head) ||
+    !src.trimEnd().slice(-8).includes('})')) {
+  throw new Error(
+    `bundle.js is not an intact CJS bundle (${bundlePath}, ${src.length} bytes).\n` +
+    `  expected head: "// @bun …" followed by "(function(exports, require, module, …) {"\n` +
+    `  expected tail: "})"\n` +
+    `  actual head:   ${JSON.stringify(src.slice(0, 90))}\n` +
+    `  actual tail:   ${JSON.stringify(src.trimEnd().slice(-40))}\n` +
+    'Re-extract it with claude-node-update.',
+  );
+}
+
 // Eval the top-level IIFE expression to get the wrapper function.
 const wrapper = (0, eval)(src);
 
