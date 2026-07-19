@@ -453,6 +453,13 @@ log "Backing up current bundle…"
 cp "$CLAUDE_NODE_DIR/bundle.js" "$CLAUDE_NODE_DIR/bundle.js.v${CURRENT}.bak"
 log "  → bundle.js.v${CURRENT}.bak"
 
+# Rotate bundle backups to the newest 5, mirroring the log rotation above.
+# Unbounded, this had grown to 59 files / 916 MB by 2026-07-19, gaining
+# ~20 MB per nightly release; five backups cover every realistic rollback
+# (the nightly auto-rollback needs exactly one). Same pipefail trap as the
+# log rotation: an empty glob makes `ls` exit 2, so subshell + || true.
+(ls -1t "$CLAUDE_NODE_DIR"/bundle.js.v*.bak 2>/dev/null | tail -n +6 | xargs -r rm -f) || true
+
 log "Deploying new bundle…"
 cp bundle.js "$CLAUDE_NODE_DIR/bundle.js"
 
