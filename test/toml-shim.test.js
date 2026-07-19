@@ -104,6 +104,17 @@ check('64-bit int does not throw (asNeeded)', () => {
 });
 check('safe-range int stays a number, not BigInt', () =>
   typeof TOML.parse('n = 9007199254740991').n === 'number');
+check('negative zero stays a number', () => {
+  // smol-toml hands back `-0` as BigInt even under "asNeeded", inside the safe
+  // range. Left alone it would break the shim's own "safe range stays plain
+  // number" contract and make an ordinary config JSON.stringify-hostile.
+  const v = TOML.parse('a = -0').a;
+  return typeof v === 'number' && JSON.stringify(TOML.parse('a = -0')) === '{"a":0}';
+});
+check('safe-range BigInt narrowing does not touch genuine 64-bit values', () => {
+  const r = TOML.parse('big = 9223372036854775807\nnegbig = -9223372036854775808');
+  return typeof r.big === 'bigint' && typeof r.negbig === 'bigint';
+});
 
 // --- 4. floats + booleans ----------------------------------------------------
 check('float', () => TOML.parse('f = 3.1415').f === 3.1415);
@@ -158,6 +169,44 @@ check('local date is source-text string', () => {
 check('local time is source-text string', () => {
   const v = TOML.parse('d = 07:32:00').d;
   return typeof v === 'string' && v === '07:32:00';
+});
+check('lowercase z terminator does not leak a spurious .000', () => {
+  // TOML 1.0 permits lowercase t/z, and smol-toml preserves the case (its Z
+  // fast path is a strict compare), so an uppercase-only lookahead would
+  // return "1979-05-27T07:32:00.000z". The terminator is upcased so output
+  // does not end up half-normalized (toISOString already turned t into T).
+  const v = TOML.parse('d = 1979-05-27t07:32:00z').d;
+  return typeof v === 'string' && v === '1979-05-27T07:32:00Z';
+});
+check('authored fractional seconds are preserved, not stripped', () => {
+  // The whole subtlety of the walker is stripping exactly ".000" while
+  // leaving real sub-second precision alone. Without this case a mutation
+  // that destroys precision passes the entire suite.
+  const r = TOML.parse('a = 1979-05-27T07:32:00.123Z\nb = 1979-05-27T07:32:00.500\nc = 07:32:00.250');
+  return r.a === '1979-05-27T07:32:00.123Z'
+      && r.b === '1979-05-27T07:32:00.500'
+      && r.c === '07:32:00.250';
+});
+check('.000 is stripped for every terminator form', () => {
+  const r = TOML.parse([
+    'a = 1979-05-27T07:32:00.000Z',
+    'b = 1979-05-27T07:32:00.000-07:00',
+    'c = 1979-05-27T07:32:00.000',
+    'd = 07:32:00.000',
+  ].join('\n'));
+  return r.a === '1979-05-27T07:32:00Z' && r.b === '1979-05-27T07:32:00-07:00'
+      && r.c === '1979-05-27T07:32:00' && r.d === '07:32:00';
+});
+// --- documented limits of the TomlDate round-trip ---------------------------
+// TomlDate is a Date subclass, so it retains neither the source spelling nor
+// sub-millisecond digits. These two cases pin the resulting divergence so it
+// stays visible in the suite instead of being rediscovered as a "bug" later.
+// Both still yield valid RFC 3339, so nothing downstream mis-parses.
+check('KNOWN LIMIT: the RFC 3339 space separator is normalized to T', () =>
+  TOML.parse('d = 1979-05-27 07:32:00Z').d === '1979-05-27T07:32:00Z');
+check('KNOWN LIMIT: sub-millisecond precision is truncated', () => {
+  const r = TOML.parse('a = 1979-05-27T07:32:00.999999\nb = 07:32:00.999999');
+  return r.a === '1979-05-27T07:32:00.999' && r.b === '07:32:00.999';
 });
 check('dates nested in tables and arrays are normalized too', () => {
   const r = TOML.parse('[t]\nd = 1979-05-27\narr = [1979-05-27, 1980-01-01]\n[[aot]]\nd = 1979-05-27');

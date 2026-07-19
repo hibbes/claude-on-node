@@ -51,11 +51,29 @@ check('constructing for a missing path does not throw', () => {
   BunFile(p('nope.txt'));
   return true;
 });
-check('construction does not read the file (lazy)', () => {
-  const f = write('lazy.txt', 'first');
+check('construction issues no read syscall (lazy)', () => {
+  // Bun: "a BunFile represents a lazily-loaded file; initializing it does not
+  // read the file from disk". Asserting only that size is uncached would NOT
+  // catch an eager slurp, so intercept the read paths instead. This matters:
+  // the sole production call site is Bun.file(<ptySock>.err), and an eager
+  // read on a socket-adjacent path could block or throw at construction.
+  const realRead = [fs.readFileSync, fs.readSync, fs.createReadStream];
+  let reads = 0;
+  fs.readFileSync = (...a) => { reads++; return realRead[0](...a); };
+  fs.readSync = (...a) => { reads++; return realRead[1](...a); };
+  fs.createReadStream = (...a) => { reads++; return realRead[2](...a); };
+  try {
+    BunFile(write('lazy.txt', 'first'));
+    return reads === 0;
+  } finally {
+    [fs.readFileSync, fs.readSync, fs.createReadStream] = realRead;
+  }
+});
+check('size is re-stat\'d, not cached at construction', () => {
+  const f = write('lazy2.txt', 'first');
   const bf = BunFile(f);
-  fs.writeFileSync(f, 'second');       // changed AFTER construction
-  return bf.size === 6;                // sees the new content, so nothing was cached
+  fs.writeFileSync(f, 'second-longer');   // changed AFTER construction
+  return bf.size === 'second-longer'.length;
 });
 check('is a Blob', () => BunFile(p('x.txt')) instanceof Blob);
 check('name is the path', () => BunFile(p('named.txt')).name === p('named.txt'));
@@ -114,11 +132,21 @@ check('empty file reads as empty, size 0', async () => {
   const f = BunFile(write('empty.txt', ''));
   return f.size === 0 && await f.text() === '';
 });
-check('bytes() view is not truncated by Buffer pooling', async () => {
-  // Buffer.alloc/readFileSync can hand back a view into a shared pool; bytes()
-  // must respect byteOffset/byteLength or it would expose neighbouring data.
+check('bytes() does not expose Node\'s shared Buffer pool', async () => {
+  // Bun: bytes() is "the same as new Uint8Array(await blob.arrayBuffer())",
+  // which means byteOffset 0 and buffer.byteLength === size. fs.readFileSync
+  // serves sub-4-KiB files out of an 8 KiB shared pool, so a bare view over
+  // the read buffer would hand callers 8192 bytes of unrelated memory via
+  // .buffer (DataView, Buffer.from(u8.buffer), crypto.subtle.digest,
+  // structuredClone transfer). Prime the pool first so a regression shows up
+  // as real foreign content, not just a length mismatch.
+  await BunFile(write('r7-prime.bin', Buffer.from('NEIGHBOURING-FILE-CONTENT'))).bytes();
   const bytes = await BunFile(write('r7.bin', Buffer.from([1, 2, 3]))).bytes();
-  return bytes.length === 3;
+  const exposed = Buffer.from(bytes.buffer).toString('latin1');
+  return bytes.length === 3
+      && bytes.byteOffset === 0
+      && bytes.buffer.byteLength === 3
+      && !exposed.includes('NEIGHBOURING');
 });
 
 // --- fd reads are positioned (the readFileSync(fd) offset trap) --------------
@@ -150,9 +178,19 @@ check('bytes() after text() on the same fd is still complete', async () => {
 // --- stat-backed properties --------------------------------------------------
 check('size matches byte length', () => BunFile(write('st1.txt', 'twelve bytes')).size === 12);
 check('size is 0 for a missing file', () => BunFile(p('missing.txt')).size === 0);
-check('lastModified reflects mtime', () => {
+check('lastModified tracks mtime, not atime or ctime', () => {
+  // On a freshly written file mtime/atime/ctime are identical, so comparing
+  // against a fresh stat would pass for any of the three fields. Force them
+  // apart first, which is the only way this can catch a wrong-field regression.
   const f = write('st2.txt', 'x');
-  return Math.abs(BunFile(f).lastModified - fs.statSync(f).mtimeMs) < 1;
+  const mtime = new Date(1e9);          // 2001
+  const atime = new Date(2e9);          // 2033
+  fs.utimesSync(f, atime, mtime);
+  const st = fs.statSync(f);
+  const got = BunFile(f).lastModified;
+  return Math.abs(got - st.mtimeMs) < 1
+      && Math.abs(got - st.atimeMs) > 1000
+      && Math.abs(got - st.ctimeMs) > 1000;
 });
 check('lastModified is 0 for a missing file', () => BunFile(p('missing2.txt')).lastModified === 0);
 check('exists() is true for a regular file', async () => await BunFile(write('st3.txt', 'x')).exists());
@@ -167,8 +205,23 @@ check('exists() is false for a directory', async () => {
   return await BunFile(d).exists() === false;
 });
 check('size still works on a directory (only exists() special-cases it)', () => {
+  // Assert the actual value, not just that a getter returns a number: the size
+  // getter can only ever return st.size or 0, so a typeof check would hold for
+  // every conceivable implementation and pin nothing. This encodes Bun's own
+  // inconsistency (oven-sh/bun#21537): size/stat work on directories,
+  // exists() alone reports false.
   const d = path.join(TMP, 'subdir');
-  return typeof BunFile(d).size === 'number';
+  fs.mkdirSync(d, { recursive: true });
+  return BunFile(d).size === fs.statSync(d).size && BunFile(d).size > 0;
+});
+check('exists() is true for a FIFO', () => {
+  // The reason exists() is implemented as !isDirectory() rather than isFile():
+  // Bun documents FIFOs as true. Without this case, "simplifying" it to
+  // isFile() would pass the whole suite.
+  const fifo = p('fifo');
+  try { require('child_process').execFileSync('mkfifo', [fifo]); }
+  catch (_) { return true; }            // no mkfifo available: skip, don't fail
+  return BunFile(fifo).exists();
 });
 
 // --- MIME type ---------------------------------------------------------------
@@ -179,8 +232,17 @@ check('unknown extension falls back to Bun\'s documented default', () =>
   BunFile(p('a.wat')).type === 'text/plain;charset=utf-8');
 check('no extension falls back to the same default', () =>
   BunFile(p('README')).type === 'text/plain;charset=utf-8');
-check('explicit options.type wins', () =>
-  BunFile(p('a.json'), { type: 'text/csv' }).type === 'text/csv');
+check('explicit options.type wins over the extension', () =>
+  BunFile(p('a.json'), { type: 'text/csv;charset=utf-8' }).type === 'text/csv;charset=utf-8');
+check('explicit text-ish type gets a charset appended, as Bun documents', () =>
+  // bun.com/docs/api/file-io shows the explicit type coming back charset-ed:
+  //   Bun.file("notreal.json", { type: "application/json" })
+  //     -> "application/json;charset=utf-8"
+  BunFile(p('a.txt'), { type: 'application/json' }).type === 'application/json;charset=utf-8');
+check('explicit binary type is left alone', () =>
+  BunFile(p('a.txt'), { type: 'image/png' }).type === 'image/png');
+check('an explicit charset is not doubled', () =>
+  BunFile(p('a.txt'), { type: 'text/html;charset=iso-8859-1' }).type === 'text/html;charset=iso-8859-1');
 check('fd input gets the default type', () => {
   const fd = fs.openSync(write('fd5.txt', 'x'), 'r');
   try { return BunFile(fd).type === 'text/plain;charset=utf-8'; } finally { fs.closeSync(fd); }

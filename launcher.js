@@ -327,6 +327,22 @@ const _bunShim_fileMime = {
   '.wasm': 'application/wasm',
 };
 
+// Bun echoes an explicitly passed type back WITH a charset appended:
+//   Bun.file("notreal.json", { type: "application/json" }).type
+//     -> "application/json;charset=utf-8"          (bun.com/docs/api/file-io)
+// Only text-ish types get one, mirroring the extension map above (image/png
+// carries no charset there either). The text-ish set is inferred from that
+// map, since the docs only spell out the JSON case.
+const _bunShim_fileCharset = (type) => {
+  const t = String(type);
+  if (/;\s*charset=/i.test(t)) return t;
+  const base = t.split(';')[0].trim().toLowerCase();
+  const textish = base.startsWith('text/')
+    || /^application\/(json|javascript|xml|xhtml\+xml)$/.test(base)
+    || base === 'image/svg+xml';
+  return textish ? `${t};charset=utf-8` : t;
+};
+
 class _BunFileShim extends Blob {
   constructor(pathOrFd, options) {
     super([]);
@@ -347,10 +363,11 @@ class _BunFileShim extends Blob {
       this.name = p;
     }
     this._type = (options && options.type)
-      || _bunShim_fileMime[path.extname(this._path || '').toLowerCase()]
-      // Bun's documented default for an unknown/absent extension, NOT
-      // application/octet-stream (bun.com/docs/api/file-io).
-      || 'text/plain;charset=utf-8';
+      ? _bunShim_fileCharset(options.type)
+      : _bunShim_fileMime[path.extname(this._path || '').toLowerCase()]
+        // Bun's documented default for an unknown/absent extension, NOT
+        // application/octet-stream (bun.com/docs/api/file-io).
+        || 'text/plain;charset=utf-8';
   }
   get type() { return this._type; }
   _stat() {
@@ -378,7 +395,15 @@ class _BunFileShim extends Blob {
   }
   async text() { return this._read().toString('utf8'); }
   async json() { return JSON.parse(this._read().toString('utf8')); }
-  async bytes() { const b = this._read(); return new Uint8Array(b.buffer, b.byteOffset, b.byteLength); }
+  // Bun documents bytes() as "the same as new Uint8Array(await
+  // blob.arrayBuffer())", i.e. byteOffset 0 and buffer.byteLength === size.
+  // A bare view over the read buffer would NOT satisfy that: fs.readFileSync
+  // serves files under 4 KiB out of Node's shared 8 KiB Buffer pool, so the
+  // view's .buffer is the whole pool at a non-zero offset and exposes
+  // unrelated bytes (including previously-read files) to anything touching
+  // .buffer directly: new DataView(u8.buffer), Buffer.from(u8.buffer),
+  // crypto.subtle.digest, structuredClone/postMessage transfer.
+  async bytes() { return new Uint8Array(await this.arrayBuffer()); }
   async arrayBuffer() { const b = this._read(); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); }
   stream() {
     const rs = this._fd !== undefined
@@ -436,27 +461,55 @@ const _bunShim_file = (pathOrFd, options) => new _BunFileShim(pathOrFd, options)
 //
 //   1. Date/times. The docs say they come back as "strings of their source
 //      text", so _bunShim_tomlDates() flattens smol-toml's TomlDate objects
-//      (Date subclasses) to that string form. TomlDate does not retain the
-//      source spelling and its toJSON() always canonicalizes milliseconds in,
-//      so we drop a redundant ".000" — byte-exact for every spelling that did
-//      not write milliseconds out, canonical RFC 3339 otherwise. NOTE: real
-//      Bun currently throws on ANY datetime ("Expected key but found -",
-//      oven-sh/bun#28687); that is an acknowledged parser bug, not a contract,
-//      so we follow the documented behaviour instead of reproducing it.
+//      (Date subclasses) to that string form. NOTE: real Bun currently throws
+//      on ANY datetime ("Expected key but found -", oven-sh/bun#28687); that
+//      is an acknowledged parser bug, not a contract, so we follow the
+//      documented behaviour instead of reproducing it.
+//
+//      "Source text" is approximated, NOT guaranteed, and the gap is a
+//      property of TomlDate rather than of this code: it is a Date subclass,
+//      so it retains neither the source spelling nor sub-millisecond digits.
+//      What survives exactly: offset date-times (Z and numeric offsets), local
+//      date-times, local dates, local times, and authored fractional seconds
+//      up to 3 digits. What does NOT:
+//        - the RFC 3339 space separator is normalized to "T"
+//          ("1979-05-27 07:32:00Z" -> "1979-05-27T07:32:00Z")
+//        - fractional seconds beyond milliseconds are truncated
+//          ("07:32:00.999999" -> "07:32:00.999")
+//      Both are pinned by tests so the limit stays visible instead of being
+//      rediscovered. Callers get RFC 3339 either way, so nothing downstream
+//      mis-parses; only byte-identity with the file is lost.
 //   2. 64-bit integers. smol-toml's DEFAULT rejects integers outside the
 //      53-bit safe range ("cannot be represented losslessly") even though TOML
 //      1.0 mandates 64-bit support, which would fail valid documents. With
-//      integersAsBigInt:"asNeeded" the safe range stays plain `number` (so
-//      normal configs are untouched) and only wider values become BigInt.
+//      integersAsBigInt:"asNeeded" only wider values become BigInt — except
+//      that smol-toml also hands back `-0` as BigInt, inside the safe range.
+//      _bunShim_tomlDates() narrows safe-range BigInts back to `number`, so
+//      "the safe range stays plain number" is true for every input, and an
+//      ordinary config cannot become JSON.stringify-hostile (that throws on
+//      BigInt) just for containing `-0`.
 //
 // Loaded lazily: require('smol-toml') costs ~7 ms on this hardware, and no
 // normal session ever reaches the import path.
 let _bunShim_tomlMod = null;
 const _bunShim_tomlDates = (v) => {
   if (v instanceof Date) {
-    // TomlDate.toJSON() yields RFC 3339 with forced ms; ".000" is redundant
-    // precision the source text almost never spelled out.
-    return v.toJSON().replace(/\.000(?=$|Z|[+-]\d{2}:\d{2}$)/, '');
+    // TomlDate.toJSON() yields RFC 3339 with milliseconds forced in; ".000" is
+    // redundant precision the source text almost never spelled out. Both
+    // terminators must be accepted: TOML 1.0 permits a lowercase "z", and
+    // smol-toml preserves that case in its output (its Z fast path is a strict
+    // compare), so a lookahead for uppercase-only would leak ".000z". Every
+    // branch is end-anchored, which also removes the over-strip surface of a
+    // bare "Z" alternative.
+    // The trailing terminator is upcased for the same reason: toISOString has
+    // already normalized a lowercase "t" separator to "T", so leaving "z"
+    // alone would emit a half-normalized "…T07:32:00z". Canonical beats mixed.
+    return v.toJSON().replace(/\.000(?=[Zz]?$|[+-]\d{2}:\d{2}$)/, '').replace(/z$/, 'Z');
+  }
+  // Safe-range BigInt (smol-toml returns `-0` that way) back to number.
+  if (typeof v === 'bigint'
+      && v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER)) {
+    return Number(v);
   }
   if (Array.isArray(v)) return v.map(_bunShim_tomlDates);
   if (v && typeof v === 'object') {
@@ -538,11 +591,21 @@ globalThis.__bunShim = {
   },
 };
 
-// Source-replace every shimmed symbol. Lookbehind ensures we don't accidentally
-// rewrite identifiers ending in "Bun" (none in the bundle today, but cheap
-// insurance against future minifier collisions).
+// Source-replace every shimmed symbol. The lookbehind rules out two things:
+//   - identifiers ending in "Bun" (none in the bundle today, but cheap
+//     insurance against future minifier collisions), and
+//   - an immediately preceding quote, i.e. a symbol at the start of a string
+//     literal. This is a text substitution over 20 MB of minified source, so
+//     without that guard it also rewrites Bun.* mentions inside strings the
+//     bundle shows to the user. 2.1.215 has exactly one, and it is precisely
+//     the message describing our own situation:
+//       detail:"Bun.Terminal unavailable (running under Node?)"
+//     which would otherwise reach the user as "__bunShim.Terminal unavailable".
+//     Same hazard AUDIT_INERT_BUN guards against in update.sh for non-shimmed
+//     symbols; note that update.sh's audit cannot catch it for SHIMMED_BUN
+//     ones, because membership short-circuits before any context inspection.
 src = src.replace(
-  /(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve)\b/g,
+  /(?<!["'`])(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve)\b/g,
   '__bunShim.$1',
 );
 

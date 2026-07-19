@@ -157,6 +157,14 @@ rollback() {
     tmp="$(mktemp)"
     jq --arg v "$v" '.version = $v' "$CLAUDE_NODE_DIR/package.json" > "$tmp"
     mv "$tmp" "$CLAUDE_NODE_DIR/package.json"
+    # Keep the lockfile in step with package.json here too, or a rolled-back
+    # tree reports two different versions depending on which file you read.
+    if [[ -f "$CLAUDE_NODE_DIR/package-lock.json" ]]; then
+        tmp="$(mktemp)"
+        jq --arg v "$v" '.version = $v | .packages[""].version = $v' \
+            "$CLAUDE_NODE_DIR/package-lock.json" > "$tmp"
+        mv "$tmp" "$CLAUDE_NODE_DIR/package-lock.json"
+    fi
     sed -i -E "s|Run Claude Code [0-9.]+'s JS bundle|Run Claude Code ${v}'s JS bundle|" \
         "$CLAUDE_NODE_DIR/launcher.js"
     log "✅ Rolled back to v$v"
@@ -389,6 +397,52 @@ if [[ ${#NEW_BUN[@]} -gt 0 ]]; then
 fi
 log "  ✓ Bun audit clean (shimmed: ${SHIMMED_BUN[*]})"
 
+# Shim backers must be resolvable, and the smoke test cannot prove it: it only
+# reaches the EAGER requires. Two blind spots meet here: the dep audit above reads
+# require() targets out of bundle.js only, so a launcher-side backer never
+# appears in it, and `--version`/`--help` only exercise the EAGER requires at the
+# top of launcher.js. A lazily required backer (smol-toml for Bun.TOML, node-pty
+# for the PTY path) can therefore be missing from node_modules while every audit
+# and both smoke probes pass, and the failure surfaces months later on the first
+# `claude import` or background terminal. npm ci, npm prune, a partial
+# node_modules restore or a fresh machine all produce exactly that state, and
+# this script never runs npm install itself.
+#
+# Runs here, alongside the audits and BEFORE anything is backed up or swapped,
+# so a failure aborts with the deployed tree untouched and needs no rollback.
+# --dry-run reaches this too, which is the point: it should validate everything
+# that does not require the new bundle to be live.
+log "Shim-backer resolvability check…"
+BACKERS=$(grep -oE "bundleRequire\('[^']+'\)" "$CLAUDE_NODE_DIR/launcher.js" \
+    | sed -E "s|bundleRequire\('([^']+)'\)|\1|" | sort -u)
+[[ -n "$BACKERS" ]] || die "No bundleRequire() backers found in launcher.js — did the loader change shape?"
+MISSING_BACKERS=()
+while read -r m; do
+    [[ -n "$m" ]] || continue
+    node -e "require.resolve('$m', {paths:['$CLAUDE_NODE_DIR']})" 2>/dev/null \
+        || MISSING_BACKERS+=("$m")
+done <<< "$BACKERS"
+if [[ ${#MISSING_BACKERS[@]} -gt 0 ]]; then
+    warn "❌ Shim backers not resolvable: ${MISSING_BACKERS[*]}"
+    die "Run 'npm install' in $CLAUDE_NODE_DIR, then re-run. (Nothing was changed.)"
+fi
+log "  ✓ all backers resolvable ($(echo $BACKERS | tr '\n' ' '))"
+
+# The committed suites assert the shim invariants (four-way symbol lockstep,
+# Bun.file and Bun.TOML semantics). They do not depend on the release being
+# fetched, so running them here means a launcher.js that was hand-edited into an
+# inconsistent state blocks the deploy instead of shipping. Fail-safe: aborting
+# leaves the working version in place.
+if [[ -d "$CLAUDE_NODE_DIR/test" ]]; then
+    log "Running shim test suites…"
+    if ! (cd "$CLAUDE_NODE_DIR" && npm test >/dev/null 2>&1); then
+        warn "❌ Shim test suites failed — refusing to deploy over a broken launcher."
+        warn "   Reproduce with: cd $CLAUDE_NODE_DIR && npm test"
+        die "Update aborted. Nothing was changed."
+    fi
+    log "  ✓ shim test suites passed"
+fi
+
 if [[ "$DRY_RUN" -eq 1 ]]; then
     log "✅ Dry-run complete — all audits passed for v${VERSION}. No changes made."
     log "   Extracted bundle: $WORK/bundle.js ($(stat -c %s "$WORK/bundle.js") bytes)"
@@ -406,6 +460,19 @@ log "Bumping package.json version…"
 tmp="$(mktemp)"
 jq --arg v "$VERSION" '.version = $v' "$CLAUDE_NODE_DIR/package.json" > "$tmp"
 mv "$tmp" "$CLAUDE_NODE_DIR/package.json"
+
+# package-lock.json carries the same version in two places and was NOT stamped
+# here until 2026-07-19, so it drifted silently for ~50 releases (found at
+# 2.1.160 while package.json said 2.1.212). Keep both in step, or `npm ci`
+# and every tool that trusts the lockfile reports a version this tree hasn't
+# run since April.
+if [[ -f "$CLAUDE_NODE_DIR/package-lock.json" ]]; then
+    log "Bumping package-lock.json version…"
+    tmp="$(mktemp)"
+    jq --arg v "$VERSION" '.version = $v | .packages[""].version = $v' \
+        "$CLAUDE_NODE_DIR/package-lock.json" > "$tmp"
+    mv "$tmp" "$CLAUDE_NODE_DIR/package-lock.json"
+fi
 
 log "Updating launcher.js version comment…"
 sed -i -E "s|Run Claude Code [0-9.]+'s JS bundle|Run Claude Code ${VERSION}'s JS bundle|" \

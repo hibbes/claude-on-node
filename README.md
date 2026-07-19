@@ -44,7 +44,7 @@ Also needed: `objcopy` (binutils) and `npm` for the updater.
   update.sh              # updater (symlinked as claude-node-update in PATH)
   package.json           # deps: Bun-shim backers + the bundle's own require() targets
   package-lock.json      # pinned dependency tree
-  test/                  # shim + lockstep tests, `npm test` (no framework, no network)
+  test/                  # shim + invariant tests, `npm test` (no framework, no dev deps)
   logs/                  # per-run updater logs (gitignored, last 20 + latest.log)
 ```
 
@@ -68,7 +68,7 @@ All 20 symbols below are source-replaced in `launcher.js` (`Bun.X` → `__bunShi
 | `Bun.which` | `which` | executable lookup |
 | `Bun.hash` | 64-bit FNV-1a (BigInt) | cache-key derivation; only `.toString()` shape is observed, so exact Wyhash parity isn't needed |
 | `Bun.deepEquals` | hand-rolled deep equality | matches `expect().toEqual()` (non-strict) and `toStrictEqual()` semantics |
-| `Bun.file` | lazy `fs`-backed `BunFile` subset (`Blob` subclass) | `exists`/`text`/`json`/`bytes`/`arrayBuffer`/`stream`/`writer`/`delete`; `slice()` throws rather than silently returning an empty blob. `exists()` is false for directories and the default MIME type is `text/plain;charset=utf-8`, both per Bun's docs |
+| `Bun.file` | lazy `fs`-backed `BunFile` subset (`Blob` subclass) | `exists`/`text`/`json`/`bytes`/`arrayBuffer`/`stream`/`writer`/`delete`; `slice()` throws rather than silently returning an empty blob. Per Bun's docs: `exists()` is false for directories, the default MIME type is `text/plain;charset=utf-8`, an explicit text-ish `type` comes back charset-suffixed, and `bytes()` copies rather than viewing (a view would expose Node's shared `Buffer` pool through `.buffer`) |
 
 `Bun.TOML` deviates from real Bun in two deliberate, documented ways, both toward accepting more valid TOML:
 
@@ -95,14 +95,17 @@ A separate `AUDIT_INERT_BUN` map in `update.sh` whitelists `Bun.*` symbols that 
 ### Tests
 
 ```
+npm install       # once: the suites exercise the shims' real npm backers
 npm test          # runs every test/*.test.js
 ```
 
-No test framework, no dev dependencies, no network, and no `bundle.js` required, so a fresh clone can run them.
+No test framework and no dev dependencies, and `bundle.js` is not needed (the suites resolve modules relative to it but never read it), so the tests run on a clone without a deployed release. They do need `node_modules`, because a shim is tested through the package that backs it rather than through a mock.
 
-- **`test/lockstep.test.js`** enforces that every shimmed symbol appears in all three places it has to: the source-replace regex, the `__bunShim` object behind it, and `SHIMMED_BUN` in `update.sh`. Each drift direction fails silently in production, which is why it is checked mechanically. The worst one is a symbol in `SHIMMED_BUN` that nothing rewrites: the audit then stays quiet while a bare `Bun.X` reaches the eval'd bundle and throws `ReferenceError` on first use.
-- **`test/bunfile-shim.test.js`** covers the `Bun.file` shim (50 cases): input forms, lazy construction, positioned `fd` reads, MIME mapping, `writer()`, `stream()`, and the deliberate `slice()` throw.
-- **`test/toml-shim.test.js`** covers the `Bun.TOML` shim (44 cases).
+- **`test/lockstep.test.js`** enforces the invariants that are silent when they break. Every shimmed symbol must appear in all four places it has to: the source-replace regex, the `__bunShim` object behind it, `SHIMMED_BUN` in `update.sh`, and the coverage tables above. The worst drift direction is a symbol in `SHIMMED_BUN` that nothing rewrites, because the audit then stays quiet while a bare `Bun.X` reaches the eval'd bundle and throws `ReferenceError` on first use; the README direction is the one that actually happened, sitting stale at 15 symbols for four releases. `SHIMMED_BUN` is read by handing the array to `bash` rather than by regex, so quoting and word-splitting agree with `update.sh` by construction. The same file also asserts that every `bundleRequire()` backer resolves (see below).
+- **`test/bunfile-shim.test.js`** covers the `Bun.file` shim (55 cases): input forms, lazy construction, positioned `fd` reads, MIME mapping, `writer()`, `stream()`, and the deliberate `slice()` throw.
+- **`test/toml-shim.test.js`** covers the `Bun.TOML` shim (51 cases), including the documented limits of the date round-trip.
+
+A lazily required shim backer is invisible to **both** deploy gates: the dep audit reads `require()` targets out of `bundle.js` only, so a launcher-side package never appears in it, and the smoke test exercises only the eager requires at the top of `launcher.js`. `smol-toml` and `node-pty` are both lazy, so `npm ci`, `npm prune`, a partial `node_modules` restore or a fresh machine could produce a tree that passes every audit and both smoke probes and then fails when a user runs `claude import` or opens a background terminal. `update.sh` therefore asserts backer resolvability before the smoke test, and `npm test` asserts it too.
 
 Shim suites extract the implementation from `launcher.js` between its `// --- <name> shim` / `// --- end <name> shim` markers and `eval` it, so the code under test is the shipped code rather than a copy that can drift. Renaming or dropping a marker makes the suite fail loudly instead of silently testing nothing. Since real Bun can never run on the hardware this project targets, a shim's semantics can only be calibrated against Bun's documentation and pinned down by cases like these, so any deliberate deviation belongs in a test with the reasoning next to it.
 
