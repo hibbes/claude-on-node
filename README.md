@@ -44,6 +44,7 @@ Also needed: `objcopy` (binutils) and `npm` for the updater.
   update.sh              # updater (symlinked as claude-node-update in PATH)
   package.json           # deps: Bun-shim backers + the bundle's own require() targets
   package-lock.json      # pinned dependency tree
+  test/                  # shim + lockstep tests, `npm test` (no framework, no network)
   logs/                  # per-run updater logs (gitignored, last 20 + latest.log)
 ```
 
@@ -90,6 +91,19 @@ Note that once a symbol is in `SHIMMED_BUN` the audit no longer flags *new* call
 A separate `AUDIT_INERT_BUN` map in `update.sh` whitelists `Bun.*` symbols that appear **only** as inert string-literal content the bundle emits verbatim (e.g. `Bun.stdin` inside a scaffolded hook-handler template). Those are deliberately **not** shimmed — source-replacing them would corrupt the emitted template — and the audit accepts them only while every occurrence still matches a recorded context fingerprint.
 
 `launcher.js` also forces `USE_BUILTIN_RIPGREP=0` so the bundle uses the system `rg` via `which`, instead of a build-time-baked `/home/runner/work/...` path that doesn't exist on a real install.
+
+### Tests
+
+```
+npm test          # runs every test/*.test.js
+```
+
+No test framework, no dev dependencies, no network, and no `bundle.js` required, so a fresh clone can run them.
+
+- **`test/lockstep.test.js`** enforces that every shimmed symbol appears in all three places it has to: the source-replace regex, the `__bunShim` object behind it, and `SHIMMED_BUN` in `update.sh`. Each drift direction fails silently in production, which is why it is checked mechanically. The worst one is a symbol in `SHIMMED_BUN` that nothing rewrites: the audit then stays quiet while a bare `Bun.X` reaches the eval'd bundle and throws `ReferenceError` on first use.
+- **`test/toml-shim.test.js`** covers the `Bun.TOML` shim (44 cases).
+
+Shim suites extract the implementation from `launcher.js` between its `// --- <name> shim` / `// --- end <name> shim` markers and `eval` it, so the code under test is the shipped code rather than a copy that can drift. Renaming or dropping a marker makes the suite fail loudly instead of silently testing nothing. Since real Bun can never run on the hardware this project targets, a shim's semantics can only be calibrated against Bun's documentation and pinned down by cases like these, so any deliberate deviation belongs in a test with the reasoning next to it.
 
 ## Dependencies
 

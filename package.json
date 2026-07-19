@@ -6,6 +6,9 @@
   "engines": {
     "node": ">=24.0.0"
   },
+  "scripts": {
+    "test": "for f in test/*.test.js; do echo \"→ $f\"; node \"$f\" || exit 1; done"
+  },
   "dependencies": {
     "ajv": "^8.17.1",
     "ajv-formats": "^3.0.1",
