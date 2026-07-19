@@ -310,7 +310,7 @@ log "Unguarded Bun.* call-site audit…"
 # (the alternation in `src.replace(/Bun\.(...)\b/g, '__bunShim.$1')`).
 SHIMMED_BUN=(
     # Real Node-equivalent implementations:
-    Bun.YAML Bun.semver Bun.Terminal Bun.spawn
+    Bun.YAML Bun.TOML Bun.semver Bun.Terminal Bun.spawn
     Bun.stringWidth Bun.stripANSI Bun.wrapAnsi Bun.which Bun.hash Bun.deepEquals
     Bun.file
     # Inert under Node (no-op / empty / undefined / false):

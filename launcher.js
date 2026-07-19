@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Run Claude Code 2.1.212's JS bundle under Node (no Bun needed).
+// Run Claude Code 2.1.215's JS bundle under Node (no Bun needed).
 // The bundle is a CJS IIFE expression: (function(exports,require,module,__filename,__dirname){...})
 // Node doesn't auto-invoke it, so we read + eval + call with module context.
 
@@ -52,6 +52,7 @@ let src = fs.readFileSync(bundlePath, 'utf8');
 //
 //   Real impl (npm/built-in):
 //     Bun.YAML.{parse,stringify}    -> yaml package
+//     Bun.TOML.parse                -> smol-toml (lazy; dates -> source-text strings)
 //     Bun.semver.{order,satisfies}  -> semver package
 //     Bun.Terminal + Bun.spawn(opts.terminal:T) -> node-pty
 //     Bun.stringWidth               -> string-width@4
@@ -411,6 +412,70 @@ class _BunFileShim extends Blob {
 const _bunShim_file = (pathOrFd, options) => new _BunFileShim(pathOrFd, options);
 // --- end Bun.file shim --------------------------------------------------------
 
+// --- Bun.TOML shim (smol-toml, normalized to Bun's documented value shapes) ---
+// 2.1.214's sole call site is `function mwy(e){return Bun.TOML.parse(e)}`, fed
+// by the `claude import` migration path (~/.codex/config.toml and
+// ~/.codex/prompts/*.toml, behind the `tengu_import` flag, default off). Both
+// callers wrap it in try/catch, so a throws-stub would merely have degraded to
+// "Could not read or parse. Review it manually." — but Bun.TOML is a
+// config-format API, and once a symbol sits in SHIMMED_BUN the audit stops
+// flagging its NEW call sites (same reasoning as the Bun.file shim above), so
+// a real parser now beats a silent landmine later.
+//
+// smol-toml: TOML 1.0/1.1, zero dependencies, ships CJS. Calibrated against
+// bun.com/docs/runtime/toml; verifying against real Bun is impossible on this
+// box (Bun SIGILLs here — the reason this project exists). Two deliberate
+// deviations, both toward accepting MORE valid TOML than we otherwise would:
+//
+//   1. Date/times. The docs say they come back as "strings of their source
+//      text", so _bunShim_tomlDates() flattens smol-toml's TomlDate objects
+//      (Date subclasses) to that string form. TomlDate does not retain the
+//      source spelling and its toJSON() always canonicalizes milliseconds in,
+//      so we drop a redundant ".000" — byte-exact for every spelling that did
+//      not write milliseconds out, canonical RFC 3339 otherwise. NOTE: real
+//      Bun currently throws on ANY datetime ("Expected key but found -",
+//      oven-sh/bun#28687); that is an acknowledged parser bug, not a contract,
+//      so we follow the documented behaviour instead of reproducing it.
+//   2. 64-bit integers. smol-toml's DEFAULT rejects integers outside the
+//      53-bit safe range ("cannot be represented losslessly") even though TOML
+//      1.0 mandates 64-bit support, which would fail valid documents. With
+//      integersAsBigInt:"asNeeded" the safe range stays plain `number` (so
+//      normal configs are untouched) and only wider values become BigInt.
+//
+// Loaded lazily: require('smol-toml') costs ~7 ms on this hardware, and no
+// normal session ever reaches the import path.
+let _bunShim_tomlMod = null;
+const _bunShim_tomlDates = (v) => {
+  if (v instanceof Date) {
+    // TomlDate.toJSON() yields RFC 3339 with forced ms; ".000" is redundant
+    // precision the source text almost never spelled out.
+    return v.toJSON().replace(/\.000(?=$|Z|[+-]\d{2}:\d{2}$)/, '');
+  }
+  if (Array.isArray(v)) return v.map(_bunShim_tomlDates);
+  if (v && typeof v === 'object') {
+    for (const k of Object.keys(v)) v[k] = _bunShim_tomlDates(v[k]);
+  }
+  return v;
+};
+const _bunShim_TOML = {
+  parse: (input) => {
+    // smol-toml silently returns {} for a number or a plain object (it only
+    // throws for null/undefined/array), which would turn a caller bug into an
+    // empty config instead of an error. Bun.TOML.parse takes a string; say so.
+    if (typeof input !== 'string') {
+      throw new TypeError(`Bun.TOML.parse expects a string, got ${typeof input}`);
+    }
+    return _bunShim_tomlDates(
+      (_bunShim_tomlMod ??= bundleRequire('smol-toml'))
+        .parse(input, { integersAsBigInt: 'asNeeded' }),
+    );
+  },
+  // Not part of Bun.TOML today (oven-sh/bun#22219 asks for it). Free from
+  // smol-toml and harmless: if Bun ever ships it, this side is already covered.
+  stringify: (value) => (_bunShim_tomlMod ??= bundleRequire('smol-toml')).stringify(value),
+};
+// --- end Bun.TOML shim --------------------------------------------------------
+
 globalThis.__bunShim = {
   YAML: {
     parse: (s) => yamlMod.parse(s),
@@ -435,6 +500,7 @@ globalThis.__bunShim = {
   hash: _bunShim_hash,
   deepEquals: _bunShim_deepEquals,
   file: _bunShim_file,
+  TOML: _bunShim_TOML,
 
   gc: () => {},
   embeddedFiles: [],
@@ -469,7 +535,7 @@ globalThis.__bunShim = {
 // rewrite identifiers ending in "Bun" (none in the bundle today, but cheap
 // insurance against future minifier collisions).
 src = src.replace(
-  /(?<![A-Za-z0-9_$])Bun\.(YAML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve)\b/g,
+  /(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve)\b/g,
   '__bunShim.$1',
 );
 
