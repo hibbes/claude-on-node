@@ -126,12 +126,54 @@ for (const [aName, a, bName, b] of pairs) {
 const backers = [...new Set(
   [...launcher.matchAll(/bundleRequire\('([^']+)'\)/g)].map((m) => m[1]),
 )].sort();
-if (backers.length === 0) fail('no bundleRequire() backers found in launcher.js — loader changed shape?');
+if (backers.length === 0) fail('no bundleRequire() backers found in launcher.js, loader changed shape?');
 const unresolvable = backers.filter((m) => {
   try { require.resolve(m, { paths: [REPO] }); return false; } catch (_) { return true; }
 });
 if (unresolvable.length) {
   fail(`shim backers not resolvable (run npm install): ${unresolvable.join(', ')}`);
+}
+
+// --- 6. README claims that a QA mutation pass proved unguarded ----------------
+// A review of this gate showed it only reads column 1 of the coverage tables:
+// mutating the prose symbol count, the documented Node version, or a backer's
+// package name all passed green. These three checks close exactly those holes.
+// Honest cost, stated up front: 6a and 6c couple to prose wording; rephrasing
+// the sentence makes the gate fail loudly (like the die() anchors above), which
+// is the acceptable failure direction, a loud false alarm beats silent drift.
+
+// 6a. The prose count "All N symbols" must equal the regex alternation's size.
+const proseCount = readme.match(/All (\d+) symbols below/);
+if (!proseCount) {
+  fail('README prose anchor "All N symbols below" not found (rephrased?) Update this test.');
+} else if (Number(proseCount[1]) !== regexSyms.size) {
+  fail(`README says "All ${proseCount[1]} symbols" but the launcher regex has ${regexSyms.size}`);
+}
+
+// 6b. Every bundleRequire() backer must appear as `name` in a coverage table
+// row AND in package.json dependencies. (The reverse direction, classifying
+// column 2 of the table, is not mechanizable: it mixes package names with
+// prose like "64-bit FNV-1a (BigInt)".)
+const pkg = JSON.parse(fs.readFileSync(path.join(REPO, 'package.json'), 'utf8'));
+const deps = new Set(Object.keys(pkg.dependencies || {}));
+const tableRows = readme.split('\n').filter((l) => l.startsWith('|'));
+for (const b of backers) {
+  if (!deps.has(b)) fail(`backer ${b} is bundleRequire()d but missing from package.json dependencies`);
+  if (!tableRows.some((l) => l.includes('`' + b + '`'))) {
+    fail(`backer ${b} is bundleRequire()d but named in no README coverage-table row`);
+  }
+}
+
+// 6c. The documented Node floor must match package.json engines.node.
+const nodeClaim = readme.match(/\*\*Node (\d+)(?:\.\d+)*(?:\.\d+)* or newer\.\*\*/);
+const engines = (pkg.engines && pkg.engines.node) || '';
+const engMajor = engines.match(/(\d+)/);
+if (!nodeClaim) {
+  fail('README prose anchor "**Node N or newer.**" not found (rephrased?) Update this test.');
+} else if (!engMajor) {
+  fail(`package.json engines.node ("${engines}") has no parsable major version`);
+} else if (Number(nodeClaim[1]) !== Number(engMajor[1])) {
+  fail(`README documents Node ${nodeClaim[1]}+ but package.json engines.node is "${engines}"`);
 }
 
 // --- report -------------------------------------------------------------------
