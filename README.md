@@ -68,7 +68,7 @@ All 20 symbols below are source-replaced in `launcher.js` (`Bun.X` → `__bunShi
 | `Bun.which` | `which` | executable lookup |
 | `Bun.hash` | 64-bit FNV-1a (BigInt) | cache-key derivation; only `.toString()` shape is observed, so exact Wyhash parity isn't needed |
 | `Bun.deepEquals` | hand-rolled deep equality | matches `expect().toEqual()` (non-strict) and `toStrictEqual()` semantics |
-| `Bun.file` | lazy `fs`-backed `BunFile` subset (`Blob` subclass) | `exists`/`text`/`json`/`bytes`/`arrayBuffer`/`stream`/`writer`/`delete`; `slice()` throws rather than silently returning an empty blob |
+| `Bun.file` | lazy `fs`-backed `BunFile` subset (`Blob` subclass) | `exists`/`text`/`json`/`bytes`/`arrayBuffer`/`stream`/`writer`/`delete`; `slice()` throws rather than silently returning an empty blob. `exists()` is false for directories and the default MIME type is `text/plain;charset=utf-8`, both per Bun's docs |
 
 `Bun.TOML` deviates from real Bun in two deliberate, documented ways, both toward accepting more valid TOML:
 
@@ -101,6 +101,7 @@ npm test          # runs every test/*.test.js
 No test framework, no dev dependencies, no network, and no `bundle.js` required, so a fresh clone can run them.
 
 - **`test/lockstep.test.js`** enforces that every shimmed symbol appears in all three places it has to: the source-replace regex, the `__bunShim` object behind it, and `SHIMMED_BUN` in `update.sh`. Each drift direction fails silently in production, which is why it is checked mechanically. The worst one is a symbol in `SHIMMED_BUN` that nothing rewrites: the audit then stays quiet while a bare `Bun.X` reaches the eval'd bundle and throws `ReferenceError` on first use.
+- **`test/bunfile-shim.test.js`** covers the `Bun.file` shim (50 cases): input forms, lazy construction, positioned `fd` reads, MIME mapping, `writer()`, `stream()`, and the deliberate `slice()` throw.
 - **`test/toml-shim.test.js`** covers the `Bun.TOML` shim (44 cases).
 
 Shim suites extract the implementation from `launcher.js` between its `// --- <name> shim` / `// --- end <name> shim` markers and `eval` it, so the code under test is the shipped code rather than a copy that can drift. Renaming or dropping a marker makes the suite fail loudly instead of silently testing nothing. Since real Bun can never run on the hardware this project targets, a shim's semantics can only be calibrated against Bun's documentation and pinned down by cases like these, so any deliberate deviation belongs in a test with the reasoning next to it.

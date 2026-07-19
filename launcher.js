@@ -348,7 +348,9 @@ class _BunFileShim extends Blob {
     }
     this._type = (options && options.type)
       || _bunShim_fileMime[path.extname(this._path || '').toLowerCase()]
-      || 'application/octet-stream';
+      // Bun's documented default for an unknown/absent extension, NOT
+      // application/octet-stream (bun.com/docs/api/file-io).
+      || 'text/plain;charset=utf-8';
   }
   get type() { return this._type; }
   _stat() {
@@ -357,7 +359,12 @@ class _BunFileShim extends Blob {
   }
   get size() { const st = this._stat(); return st ? st.size : 0; }
   get lastModified() { const st = this._stat(); return st ? st.mtimeMs : 0; }
-  async exists() { return this._stat() !== null; }
+  // "Returns true for regular files and FIFOs. It returns false for
+  // directories" (bun.com/reference/bun/BunFile/exists). statSync succeeds on a
+  // directory, so that case needs calling out explicitly; !isDirectory() rather
+  // than isFile() keeps FIFOs true as documented. Note that size/lastModified
+  // deliberately still work on a directory, matching Bun (oven-sh/bun#21537).
+  async exists() { const st = this._stat(); return st !== null && !st.isDirectory(); }
   _read() {
     if (this._fd !== undefined) {
       // Positioned read from 0: fs.readFileSync(fd) would consume the fd's
