@@ -323,8 +323,8 @@ SHIMMED_BUN=(
     Bun.file
     # Inert under Node (no-op / empty / undefined / false):
     Bun.gc Bun.embeddedFiles Bun.JSONL Bun.isStandaloneExecutable
-    # Throws on first use (rare paths: REPL, heap-dump, bg-pty TCP host, gateway):
-    Bun.generateHeapSnapshot Bun.Transpiler Bun.listen Bun.serve
+    # Throws on first use (rare paths: REPL, heap-dump, agent-proxy relay, gateway):
+    Bun.generateHeapSnapshot Bun.Transpiler Bun.listen Bun.serve Bun.connect
 )
 
 # Bun.* symbols the regex audit sees but that are NOT executable call sites:

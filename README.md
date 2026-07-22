@@ -52,7 +52,7 @@ The recommended setup keeps the working tree at `~/.claude-node/` and a wrapper 
 
 ## Bun shim coverage
 
-All 20 symbols below are source-replaced in `launcher.js` (`Bun.X` → `__bunShim.X`) before the bundle is evaluated. The set must stay in lockstep with `SHIMMED_BUN` in `update.sh`, which the release audit checks against.
+All 21 symbols below are source-replaced in `launcher.js` (`Bun.X` → `__bunShim.X`) before the bundle is evaluated. The set must stay in lockstep with `SHIMMED_BUN` in `update.sh`, which the release audit checks against.
 
 **Real Node-equivalent implementations:**
 
@@ -84,7 +84,7 @@ All 20 symbols below are source-replaced in `launcher.js` (`Bun.X` → `__bunShi
 | `Bun.JSONL` | `undefined` |
 | `Bun.isStandaloneExecutable` | `false` (a *value*, not a function: the call site is `Bun.isStandaloneExecutable===!0`, and a function object would be truthy) |
 
-**Throw on first use** (rare paths only — REPL, heap-dump, background-PTY/agent-proxy listener, `claude gateway`): `Bun.generateHeapSnapshot`, `Bun.Transpiler`, `Bun.listen`, `Bun.serve`.
+**Throw on first use** (rare paths only: REPL, heap-dump, agent-proxy relay, `claude gateway`): `Bun.generateHeapSnapshot`, `Bun.Transpiler`, `Bun.listen`, `Bun.serve`, `Bun.connect`.
 
 Note that once a symbol is in `SHIMMED_BUN` the audit no longer flags *new* call sites for it. That is why symbols with a cheap, well-defined Node equivalent (`Bun.file`, `Bun.TOML`) get a real implementation even when today's only call site is cold: a throws-stub would become a silent landmine as soon as a future release grows a second, hotter site.
 
@@ -153,6 +153,7 @@ The shape of the extracted bundle can change between Claude Code releases. Notab
 - **v2.1.198** — `Bun.isStandaloneExecutable` appeared as a *property* read, not a call. Shimmed as the value `false`; a `() => false` stub would be truthy and route into standalone/embedded mode.
 - **v2.1.201** — `Bun.file` replaced an `fs.openSync` call site. Given a real `fs`-backed shim rather than a stub, since the audit stops flagging new sites once a symbol is shimmed.
 - **v2.1.214** — `Bun.TOML.parse` arrived with the `claude import` migration feature (importing OpenAI Codex / Gemini CLI config). Backed by `smol-toml`; see the deviation notes under *Bun shim coverage*.
+- **v2.1.217**: first unguarded `Bun.connect`, the direct-dial (CONNECT) client of the agent-proxy selective relay. Left as a throws-stub: its only caller sits inside the relay's request handling, and the relay's server is the `Bun.listen` site that already throws under Node, so the dial-out is unreachable by construction.
 
 ## Security notes
 

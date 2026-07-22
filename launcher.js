@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Run Claude Code 2.1.215's JS bundle under Node (no Bun needed).
+// Run Claude Code 2.1.217's JS bundle under Node (no Bun needed).
 // The bundle is a CJS IIFE expression: (function(exports,require,module,__filename,__dirname){...})
 // Node doesn't auto-invoke it, so we read + eval + call with module context.
 
@@ -69,8 +69,8 @@ let src = fs.readFileSync(bundlePath, 'utf8');
 //     Bun.JSONL                     -> undefined (Bun.JSONL?.parseChunk → undefined)
 //     Bun.isStandaloneExecutable    -> false (running under Node, not a compiled Bun SFE)
 //
-//   Throws on first use (rare paths: REPL, heap-dump, bg-pty TCP host, gateway):
-//     Bun.generateHeapSnapshot, Bun.Transpiler, Bun.listen, Bun.serve
+//   Throws on first use (rare paths: REPL, heap-dump, agent-proxy relay, gateway):
+//     Bun.generateHeapSnapshot, Bun.Transpiler, Bun.listen, Bun.serve, Bun.connect
 const bundleRequire = Module.createRequire(bundlePath);
 const yamlMod = bundleRequire('yaml');
 const semverMod = bundleRequire('semver');
@@ -589,6 +589,14 @@ globalThis.__bunShim = {
     // check, so this path is never reached in normal CLI use.
     throw new Error('Bun.serve not supported under Node (claude gateway requires the native binary)');
   },
+  connect: () => {
+    // agent-proxy selective relay, direct-dial path (v2.1.217): the client
+    // side of the same relay whose server is the Bun.listen site above. Its
+    // only caller runs inside that relay's CONNECT handling, so under Node it
+    // is unreachable by construction; the listen stub throws before the relay
+    // could ever accept a request, let alone dial upstream.
+    throw new Error('Bun.connect not supported under Node');
+  },
 };
 
 // Source-replace every shimmed symbol. The lookbehind rules out two things:
@@ -605,7 +613,7 @@ globalThis.__bunShim = {
 //     symbols; note that update.sh's audit cannot catch it for SHIMMED_BUN
 //     ones, because membership short-circuits before any context inspection.
 src = src.replace(
-  /(?<!["'`])(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve)\b/g,
+  /(?<!["'`])(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve|connect)\b/g,
   '__bunShim.$1',
 );
 
