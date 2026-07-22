@@ -564,7 +564,7 @@ const _bunShim_TOML = {
 function _bunShim_makeStringWidth(delegate, limits) {
   const ASCII_PRINTABLE = /^[\x20-\x7E]*$/;
   const cacheFloor = (limits && limits.cacheFloor) || 256;
-  const cacheBudget = (limits && limits.cacheBudget) || 32 * 1024 * 1024;
+  const cacheBudget = (limits && limits.cacheBudget) || 96 * 1024 * 1024;
   const cache = new Map();
   let cachedChars = 0;
   return (input, opts) => {
