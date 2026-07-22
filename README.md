@@ -62,7 +62,7 @@ All 21 symbols below are source-replaced in `launcher.js` (`Bun.X` → `__bunShi
 | `Bun.TOML.parse` | `smol-toml` (lazy) | `claude import` reads Codex `config.toml` / `prompts/*.toml`. See the deviation note below |
 | `Bun.semver.order` / `satisfies` | `semver` | version comparisons |
 | `Bun.Terminal` + `Bun.spawn(opts.terminal)` | `node-pty` | background PTY sessions (non-PTY `Bun.spawn` throws — no such call site exists today) |
-| `Bun.stringWidth` | `string-width` | ANSI-aware width for help/UI layout |
+| `Bun.stringWidth` | `string-width` | ANSI-aware width for help/UI layout; printable-ASCII fast path plus bounded memo cache so multi-MB tool_results (base64 screenshots) cannot stall Ink rendering on slow CPUs |
 | `Bun.stripANSI` | `strip-ansi` | |
 | `Bun.wrapAnsi` | `wrap-ansi` | |
 | `Bun.which` | `which` | executable lookup |

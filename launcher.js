@@ -55,7 +55,7 @@ let src = fs.readFileSync(bundlePath, 'utf8');
 //     Bun.TOML.parse                -> smol-toml (lazy; dates -> source-text strings)
 //     Bun.semver.{order,satisfies}  -> semver package
 //     Bun.Terminal + Bun.spawn(opts.terminal:T) -> node-pty
-//     Bun.stringWidth               -> string-width@4
+//     Bun.stringWidth               -> string-width@4 (ASCII fast path + memo cache)
 //     Bun.stripANSI                 -> strip-ansi@6
 //     Bun.wrapAnsi                  -> wrap-ansi@7
 //     Bun.which                     -> which@3
@@ -74,7 +74,6 @@ let src = fs.readFileSync(bundlePath, 'utf8');
 const bundleRequire = Module.createRequire(bundlePath);
 const yamlMod = bundleRequire('yaml');
 const semverMod = bundleRequire('semver');
-const stringWidthMod = bundleRequire('string-width');
 const stripAnsiMod = bundleRequire('strip-ansi');
 const wrapAnsiMod = bundleRequire('wrap-ansi');
 const whichMod = bundleRequire('which');
@@ -536,6 +535,61 @@ const _bunShim_TOML = {
 };
 // --- end Bun.TOML shim --------------------------------------------------------
 
+// --- Bun.stringWidth shim (string-width@4 + ASCII fast path + memo cache) ----
+// Bun.stringWidth is native and effectively free; string-width@4 walks the
+// string in JS. The bundle's single call site (Ink layout) re-measures
+// transcript lines on every render frame, so a session whose transcript
+// carries multi-MB tool_results (a Read on a 5 MB screenshot PNG returns its
+// base64 as one string) spends minutes per frame inside stringWidth on slow
+// CPUs: the event loop starves and the session looks hard-frozen at 100% CPU.
+// Observed 22.07.2026 on two sessions, Inspector stacks identical
+// (processImmediate -> Ink render -> stringWidth), on both 2.1.215 and
+// 2.1.217. Two layers remove the cost without changing delegate semantics:
+//   1. Printable-ASCII fast path: width == length after one regex scan.
+//      Correct by construction: [\x20-\x7E] contains no ESC (0x1B), hence no
+//      ANSI sequences, and no combining, wide or ambiguous code points, so
+//      both documented Bun.stringWidth options are no-ops on this subset.
+//      Base64 payloads are pure ASCII and always resolve here.
+//   2. Memo cache for strings >= cacheFloor chars, keyed by the string value
+//      alone and consulted before the fast path so repeated giant strings
+//      skip even the regex scan. Bounded by cacheBudget total chars; Map
+//      insertion order gives oldest-first eviction. Short strings are cheap
+//      to re-measure and would only churn the cache.
+// The key deliberately ignores the options argument: the bundle always passes
+// {ambiguousIsNarrow:true} and string-width@4 accepts no options at all, so
+// results cannot depend on them. stringwidth-shim.test.js pins that delegate
+// property; a future delegate upgrade that honors options trips the pin and
+// forces this key to be revisited.
+// limits is a test seam; production uses the defaults.
+function _bunShim_makeStringWidth(delegate, limits) {
+  const ASCII_PRINTABLE = /^[\x20-\x7E]*$/;
+  const cacheFloor = (limits && limits.cacheFloor) || 256;
+  const cacheBudget = (limits && limits.cacheBudget) || 32 * 1024 * 1024;
+  const cache = new Map();
+  let cachedChars = 0;
+  return (input, opts) => {
+    const s = String(input ?? '');
+    const cacheable = s.length >= cacheFloor && s.length <= cacheBudget;
+    if (cacheable) {
+      const hit = cache.get(s);
+      if (hit !== undefined) return hit;
+    }
+    const w = ASCII_PRINTABLE.test(s) ? s.length : delegate(s, opts);
+    if (cacheable) {
+      while (cachedChars + s.length > cacheBudget && cache.size > 0) {
+        const oldest = cache.keys().next().value;
+        cachedChars -= oldest.length;
+        cache.delete(oldest);
+      }
+      cache.set(s, w);
+      cachedChars += s.length;
+    }
+    return w;
+  };
+}
+const _bunShim_stringWidth = _bunShim_makeStringWidth(bundleRequire('string-width'));
+// --- end Bun.stringWidth shim -------------------------------------------------
+
 globalThis.__bunShim = {
   YAML: {
     parse: (s) => yamlMod.parse(s),
@@ -550,7 +604,7 @@ globalThis.__bunShim = {
   Terminal: _BunTerminalShim,
   spawn: _bunShim_spawn,
 
-  stringWidth: (s, opts) => stringWidthMod(String(s ?? ''), opts),
+  stringWidth: _bunShim_stringWidth,
   stripANSI: (s) => stripAnsiMod(String(s ?? '')),
   wrapAnsi: (s, cols, opts) => wrapAnsiMod(String(s ?? ''), Number(cols) || 80, opts),
   which: (cmd, opts) => {
