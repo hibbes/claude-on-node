@@ -52,7 +52,7 @@ The recommended setup keeps the working tree at `~/.claude-node/` and a wrapper 
 
 ## Bun shim coverage
 
-All 21 symbols below are source-replaced in `launcher.js` (`Bun.X` → `__bunShim.X`) before the bundle is evaluated. The set must stay in lockstep with `SHIMMED_BUN` in `update.sh`, which the release audit checks against.
+All 22 symbols below are source-replaced in `launcher.js` (`Bun.X` → `__bunShim.X`) before the bundle is evaluated. The set must stay in lockstep with `SHIMMED_BUN` in `update.sh`, which the release audit checks against.
 
 **Real Node-equivalent implementations:**
 
@@ -84,7 +84,9 @@ All 21 symbols below are source-replaced in `launcher.js` (`Bun.X` → `__bunShi
 | `Bun.JSONL` | `undefined` |
 | `Bun.isStandaloneExecutable` | `false` (a *value*, not a function: the call site is `Bun.isStandaloneExecutable===!0`, and a function object would be truthy) |
 
-**Throw on first use** (rare paths only: REPL, heap-dump, agent-proxy relay, `claude gateway`): `Bun.generateHeapSnapshot`, `Bun.Transpiler`, `Bun.listen`, `Bun.serve`, `Bun.connect`.
+**Throw on first use** (rare paths only: REPL, heap-dump, agent-proxy relay, `claude gateway`): `Bun.generateHeapSnapshot`, `Bun.Transpiler`, `Bun.listen`, `Bun.serve`, `Bun.connect`, and every member of the `Bun.ant` namespace (next paragraph).
+
+`Bun.ant` (since v2.1.219) is not public Bun API but a namespace of Anthropic-private natives in their custom Bun build. Known members: `getPeerUid` (SO_PEERCRED peer-uid lookup on the local daemon socket) and `setDumpable` (prctl `PR_SET_DUMPABLE` core-dump hardening). Node core exposes neither syscall, and before v2.1.219 the same call sites went through `bun:ffi`, whose `require()` throws under Node into the same in-bundle try/catch fallbacks, so throwing is behavior-preserving. Because the release audit's symbol regex only ever sees the token `Bun.ant`, `update.sh` additionally audits the bundle's `Bun.ant.<member>` spellings against its `ANT_MEMBERS` list, and the shim is a Proxy that throws on any *unknown* member read: a plain object would return a silent `undefined`, which for a property read is silently wrong (the `Bun.isStandaloneExecutable` lesson). Generic object protocols (symbol keys, `then`, `toJSON`) pass through quietly so logging, `await` and `JSON.stringify` cannot crash far from any `Bun.ant` context.
 
 Note that once a symbol is in `SHIMMED_BUN` the audit no longer flags *new* call sites for it. That is why symbols with a cheap, well-defined Node equivalent (`Bun.file`, `Bun.TOML`) get a real implementation even when today's only call site is cold: a throws-stub would become a silent landmine as soon as a future release grows a second, hotter site.
 
@@ -154,6 +156,7 @@ The shape of the extracted bundle can change between Claude Code releases. Notab
 - **v2.1.201** — `Bun.file` replaced an `fs.openSync` call site. Given a real `fs`-backed shim rather than a stub, since the audit stops flagging new sites once a symbol is shimmed.
 - **v2.1.214** — `Bun.TOML.parse` arrived with the `claude import` migration feature (importing OpenAI Codex / Gemini CLI config). Backed by `smol-toml`; see the deviation notes under *Bun shim coverage*.
 - **v2.1.217**: first unguarded `Bun.connect`, the direct-dial (CONNECT) client of the agent-proxy selective relay. Left as a throws-stub: its only caller sits inside the relay's request handling, and the relay's server is the `Bun.listen` site that already throws under Node, so the dial-out is unreachable by construction.
+- **v2.1.219**: `Bun.ant` arrived, a namespace of Anthropic-private natives (members `getPeerUid` and `setDumpable`, both migrated from `bun:ffi` call sites whose callers degrade in-bundle). Shimmed as a Proxy that throws per member, plus a member-level release audit (`ANT_MEMBERS` in `update.sh`), because the symbol-level audit stops seeing new members once `Bun.ant` itself is in `SHIMMED_BUN`.
 
 ## Security notes
 

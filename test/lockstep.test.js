@@ -176,6 +176,56 @@ if (!nodeClaim) {
   fail(`README documents Node ${nodeClaim[1]}+ but package.json engines.node is "${engines}"`);
 }
 
+// --- 7. Bun.ant member lockstep ------------------------------------------------
+// Bun.ant is a NAMESPACE: the symbol-level lists above carry only `ant`, so the
+// four-way check cannot see a drift between the members launcher.js implements
+// (_bunShim_antMembers), the members update.sh's release audit accepts
+// (ANT_MEMBERS), and the members the README documents. Each direction fails
+// silently in production: a member in ANT_MEMBERS that launcher.js lacks makes
+// the audit wave a release through whose call site then hits the Proxy's
+// unknown-member throw OUTSIDE any planned degradation story; a launcher member
+// missing from ANT_MEMBERS re-blocks the next release for no reason.
+const antBlockStart = launcher.indexOf('const _bunShim_antMembers = {');
+if (antBlockStart === -1) die('_bunShim_antMembers not found in launcher.js');
+let antDepth = 0;
+let antEnd = -1;
+for (let i = launcher.indexOf('{', antBlockStart); i < launcher.length; i++) {
+  const ch = launcher[i];
+  if (ch === '{') antDepth++;
+  else if (ch === '}') { antDepth--; if (antDepth === 0) { antEnd = i; break; } }
+}
+if (antEnd === -1) die('could not find the end of _bunShim_antMembers');
+const antBody = launcher.slice(antBlockStart, antEnd);
+const antLauncher = new Set(
+  [...antBody.matchAll(/^ {2}(?:['"])?([A-Za-z_$][A-Za-z0-9_$]*)(?:['"])?\s*[:(]/gm)].map((m) => m[1]),
+);
+
+const antShMatch = update.match(/ANT_MEMBERS=\([\s\S]*?\)/);
+if (!antShMatch) die('ANT_MEMBERS array not found in update.sh');
+let antAudit;
+try {
+  const out = execFileSync('bash', ['-c', `${antShMatch[0]}\nprintf '%s\\n' "\${ANT_MEMBERS[@]}"`],
+    { encoding: 'utf8' });
+  antAudit = new Set(out.split('\n').filter(Boolean));
+} catch (err) {
+  die(`could not evaluate ANT_MEMBERS with bash: ${err.message}`);
+}
+
+const antOnlyLauncher = diff(antLauncher, antAudit);
+const antOnlyAudit = diff(antAudit, antLauncher);
+if (antOnlyLauncher.size) fail(`Bun.ant members in launcher.js but not in ANT_MEMBERS: ${fmt(antOnlyLauncher)}`);
+if (antOnlyAudit.size) fail(`Bun.ant members in ANT_MEMBERS but not in launcher.js: ${fmt(antOnlyAudit)}`);
+
+// Every known member must also be named (in backticks) inside the README
+// coverage section, so the documentation cannot silently fall behind the code
+// the way the symbol tables once did.
+const coverage = readme.slice(secStart, secEnd);
+for (const m of antAudit) {
+  if (!coverage.includes('`' + m + '`')) {
+    fail(`Bun.ant member ${m} is not documented in the README coverage section`);
+  }
+}
+
 // --- report -------------------------------------------------------------------
 if (process.exitCode) {
   console.error(`\n  regex:       ${fmt(regexSyms)}`);
@@ -187,4 +237,4 @@ if (process.exitCode) {
 }
 
 console.log(`✓ shim lockstep holds across all four lists (${regexSyms.size} symbols), `
-  + `${backers.length} backers resolvable`);
+  + `${backers.length} backers resolvable, ${antAudit.size} Bun.ant members paired`);

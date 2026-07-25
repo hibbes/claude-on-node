@@ -325,6 +325,8 @@ SHIMMED_BUN=(
     Bun.gc Bun.embeddedFiles Bun.JSONL Bun.isStandaloneExecutable
     # Throws on first use (rare paths: REPL, heap-dump, agent-proxy relay, gateway):
     Bun.generateHeapSnapshot Bun.Transpiler Bun.listen Bun.serve Bun.connect
+    # Anthropic-private native namespace (Proxy; members audited separately below):
+    Bun.ant
 )
 
 # Bun.* symbols the regex audit sees but that are NOT executable call sites:
@@ -396,6 +398,45 @@ if [[ ${#NEW_BUN[@]} -gt 0 ]]; then
     warn "Continuing because --force was passed."
 fi
 log "  ✓ Bun audit clean (shimmed: ${SHIMMED_BUN[*]})"
+
+log "Bun.ant member audit…"
+# Bun.ant (v2.1.219) is a NAMESPACE of Anthropic-private natives, not a single
+# API. The symbol audit above only ever sees the token `Bun.ant`, so once that
+# entered SHIMMED_BUN, a release growing a new member (Bun.ant.newThing) would
+# deploy without any audit noticing. This block closes that hole at the member
+# level: every Bun.ant.<member> spelling in the bundle must be one launcher.js
+# knowingly shims (today: throws into the call sites' own try/catch fallbacks,
+# the same degradation the pre-2.1.219 bun:ffi paths had under Node).
+#
+# ANT_MEMBERS must stay in lockstep with _bunShim_antMembers in launcher.js;
+# test/lockstep.test.js enforces that pairing. Runtime backstop for spellings
+# this text-level scan cannot see (minifier aliasing like `let a=Bun.ant`):
+# the shim Proxy throws loudly on any unknown member read.
+ANT_MEMBERS=( getPeerUid setDumpable )
+mapfile -t ANT_HITS < <(
+python3 - <<'PY'
+import re
+src = open('bundle.js').read()
+for s in sorted(set(m.group(1) for m in re.finditer(r'Bun\.ant\.([A-Za-z_$][A-Za-z0-9_$]*)', src))):
+    print(s)
+PY
+)
+NEW_ANT=()
+for m in "${ANT_HITS[@]}"; do
+    if ! printf '%s\n' "${ANT_MEMBERS[@]}" | grep -qxF "$m"; then
+        NEW_ANT+=("Bun.ant.$m")
+    fi
+done
+if [[ ${#NEW_ANT[@]} -gt 0 ]]; then
+    warn "NEW Bun.ant members: ${NEW_ANT[*]}"
+    warn "Extend _bunShim_antMembers in launcher.js and ANT_MEMBERS here in"
+    warn "lockstep (decide throw vs. real impl from the call site's fallback)."
+    if [[ "$FORCE" -eq 0 ]]; then
+        die "Investigate, add member shims if needed, then re-run with --force"
+    fi
+    warn "Continuing because --force was passed."
+fi
+log "  ✓ Bun.ant member audit clean (members: ${ANT_HITS[*]:-none} / known: ${ANT_MEMBERS[*]})"
 
 # Shim backers must be resolvable, and the smoke test cannot prove it: it only
 # reaches the EAGER requires. Two blind spots meet here: the dep audit above reads

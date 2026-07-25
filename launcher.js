@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Run Claude Code 2.1.215's JS bundle under Node (no Bun needed).
+// Run Claude Code 2.1.220's JS bundle under Node (no Bun needed).
 // The bundle is a CJS IIFE expression: (function(exports,require,module,__filename,__dirname){...})
 // Node doesn't auto-invoke it, so we read + eval + call with module context.
 
@@ -71,6 +71,10 @@ let src = fs.readFileSync(bundlePath, 'utf8');
 //
 //   Throws on first use (rare paths: REPL, heap-dump, agent-proxy relay, gateway):
 //     Bun.generateHeapSnapshot, Bun.Transpiler, Bun.listen, Bun.serve, Bun.connect
+//
+//   Anthropic-private native namespace (Proxy: known members throw on call,
+//   unknown member READS throw too; see the Bun.ant shim block):
+//     Bun.ant.{getPeerUid,setDumpable}  (SO_PEERCRED / prctl; ex-bun:ffi paths)
 const bundleRequire = Module.createRequire(bundlePath);
 const yamlMod = bundleRequire('yaml');
 const semverMod = bundleRequire('semver');
@@ -590,6 +594,56 @@ function _bunShim_makeStringWidth(delegate, limits) {
 const _bunShim_stringWidth = _bunShim_makeStringWidth(bundleRequire('string-width'));
 // --- end Bun.stringWidth shim -------------------------------------------------
 
+// --- Bun.ant shim (Anthropic-private native namespace, throws per member) ----
+// v2.1.219 introduced `Bun.ant`, a namespace of Anthropic-private natives in
+// their custom Bun build, with two members at two call sites:
+//   - Bun.ant.getPeerUid(fd): SO_PEERCRED peer-uid lookup on the
+//     com.anthropic.claude-daemon socket; the caller catches, warns
+//     "[daemon] peer uid lookup failed" and returns null.
+//   - Bun.ant.setDumpable(false): prctl(PR_SET_DUMPABLE, 0) hardening; the
+//     caller catches and logs "prctl unavailable".
+// Node core exposes neither syscall, and under 2.1.218 the same two paths went
+// through bun:ffi, whose require() throws under Node into those same catches.
+// Throwing preserves that behavior exactly; a real implementation would need a
+// native FFI dep (koffi) for paths that already degrade by design.
+//
+// The namespace shape is the real hazard: the release audit's symbol regex
+// sees only `Bun.ant`, so with it in SHIMMED_BUN a future member
+// (Bun.ant.newThing) would deploy unaudited. Two layers against that:
+//   - update.sh audits the bundle's Bun.ant.<member> spellings against
+//     ANT_MEMBERS and blocks a release that grows one (kept in lockstep with
+//     the member keys below by test/lockstep.test.js).
+//   - This Proxy throws on ANY unknown member READ, naming the member. A plain
+//     object would return undefined: silent, and for a property read silently
+//     wrong (the Bun.isStandaloneExecutable lesson). The read-throw also
+//     covers minifier aliasing (`let a=Bun.ant; a.newThing`), which a
+//     text-level audit cannot see.
+// Allowed through quietly: symbol keys, `then` and `toJSON` (generic object
+// protocols: logging, await, JSON.stringify and util.inspect must not crash
+// far from any Bun.ant context). Every other unknown read throws.
+const _bunShim_antMembers = {
+  getPeerUid(_fd) {
+    throw new Error('Bun.ant.getPeerUid (SO_PEERCRED) not supported under Node; '
+      + 'the daemon peer-uid check degrades in-bundle (warn + null), as it did via bun:ffi before 2.1.219');
+  },
+  setDumpable(_flag) {
+    throw new Error('Bun.ant.setDumpable (prctl PR_SET_DUMPABLE) not supported under Node; '
+      + 'the caller logs "prctl unavailable" and continues, as it did via bun:ffi before 2.1.219');
+  },
+};
+const _bunShim_ant = new Proxy(_bunShim_antMembers, {
+  get(target, prop, receiver) {
+    if (typeof prop === 'symbol' || prop in target
+        || prop === 'then' || prop === 'toJSON') {
+      return Reflect.get(target, prop, receiver);
+    }
+    throw new Error(`Bun.ant.${prop} is not shimmed under Node `
+      + '(new member of the Anthropic-private native namespace? '
+      + 'See the Bun.ant shim in launcher.js and ANT_MEMBERS in update.sh)');
+  },
+});
+// --- end Bun.ant shim ---------------------------------------------------------
+
 globalThis.__bunShim = {
   YAML: {
     parse: (s) => yamlMod.parse(s),
@@ -651,6 +705,11 @@ globalThis.__bunShim = {
     // could ever accept a request, let alone dial upstream.
     throw new Error('Bun.connect not supported under Node');
   },
+
+  // Anthropic-private native namespace (v2.1.219): a Proxy whose known members
+  // throw on call and whose unknown member reads throw loudly. See the
+  // Bun.ant shim block above for why a plain object would be a silent landmine.
+  ant: _bunShim_ant,
 };
 
 // Source-replace every shimmed symbol. The lookbehind rules out two things:
@@ -667,7 +726,7 @@ globalThis.__bunShim = {
 //     symbols; note that update.sh's audit cannot catch it for SHIMMED_BUN
 //     ones, because membership short-circuits before any context inspection.
 src = src.replace(
-  /(?<!["'`])(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve|connect)\b/g,
+  /(?<!["'`])(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve|connect|ant)\b/g,
   '__bunShim.$1',
 );
 
