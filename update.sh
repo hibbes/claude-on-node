@@ -490,9 +490,19 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     exit 0
 fi
 
-log "Backing up current bundle…"
-cp "$CLAUDE_NODE_DIR/bundle.js" "$CLAUDE_NODE_DIR/bundle.js.v${CURRENT}.bak"
-log "  → bundle.js.v${CURRENT}.bak"
+# NOTE: on a fresh clone / first-time deploy, package.json can already record
+# a version (e.g. committed by whoever last maintained the tree) while
+# bundle.js has never actually been written to disk on THIS machine. In that
+# case CURRENT == VERSION is possible too (handled above by --force), but even
+# on a genuine version bump there may simply be no prior bundle.js yet. Guard
+# the backup so first-time deploys don't abort on a missing source file.
+if [[ -f "$CLAUDE_NODE_DIR/bundle.js" ]]; then
+    log "Backing up current bundle…"
+    cp "$CLAUDE_NODE_DIR/bundle.js" "$CLAUDE_NODE_DIR/bundle.js.v${CURRENT}.bak"
+    log "  → bundle.js.v${CURRENT}.bak"
+else
+    log "No existing bundle to back up (first-time deploy)."
+fi
 
 # Rotate bundle backups to the newest 5, mirroring the log rotation above.
 # Unbounded, this had grown to 59 files / 916 MB by 2026-07-19, gaining
