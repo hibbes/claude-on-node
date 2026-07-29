@@ -1,0 +1,104 @@
+#!/usr/bin/env node
+// bun PATH dispatcher for claude-on-node plugin support.
+//
+// Intercepts `bun run --cwd <dir>` invocations (as used by Claude Code
+// plugin spawning) and routes them through Node with the Bun API shim.
+//
+// Usage:
+//   bun run --cwd <plugin-dir>          — resolve entry from package.json
+//   bun run --cwd <plugin-dir> <file>   — run the specified script file
+//   bun --version                       — print shim version
+//   bun --help                          — print this message
+//
+// For any other invocation, prints a helpful error. There is no real Bun
+// on this system — that is the reason this shim exists.
+
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
+
+// --- helpers ------------------------------------------------------------------
+
+const VERSION = 'claude-on-node plugin shim 1.0';
+const SHIM = path.resolve(__dirname, '..', 'plugin-shim.js');
+
+const help = () => console.log(`\
+${VERSION}
+
+Intercepts \`bun run --cwd <dir>\` and runs plugin code under Node with
+Bun API shims from plugin-shim.js.
+
+Usage:
+  bun run --cwd <dir> [entry] [args...]
+
+Flags:
+  --version          print version and exit
+  --help             print this message and exit
+`);
+
+const die = (msg) => { console.error(`bun: ${msg}`); process.exit(1); };
+
+// --- arg parsing --------------------------------------------------------------
+
+const args = process.argv.slice(2);
+
+if (!args.length || args[0] === '--help') { help(); process.exit(0); }
+if (args[0] === '--version') { console.log(VERSION); process.exit(0); }
+
+let cwd = null;
+let foundRun = false;
+let scriptArg = null;
+const extraArgs = [];
+
+for (let i = 0; i < args.length; i++) {
+  if (!foundRun && args[i] === 'run') {
+    foundRun = true;
+  } else if (foundRun && !cwd && args[i] === '--cwd' && i + 1 < args.length) {
+    cwd = path.resolve(args[++i]);
+  } else if (foundRun && cwd && scriptArg === null) {
+    scriptArg = args[i];
+  } else if (foundRun && cwd && scriptArg !== null) {
+    extraArgs.push(args[i]);
+  }
+}
+
+if (!foundRun) {
+  die('only `bun run --cwd <dir>` is supported under the claude-on-node shim.'
+    + '\n  This system has no working Bun binary.');
+}
+if (!cwd) {
+  // `bun run` without --cwd: use current directory
+  cwd = process.cwd();
+}
+
+// --- entry point resolution ---------------------------------------------------
+
+let entry;
+const pkgPath = path.join(cwd, 'package.json');
+
+if (scriptArg !== null) {
+  // A specific file or script name was given
+  entry = path.resolve(cwd, scriptArg);
+} else if (fs.existsSync(pkgPath)) {
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+  entry = (pkg.main && path.resolve(cwd, pkg.main))
+    || (typeof pkg.bin === 'string' ? path.resolve(cwd, pkg.bin)
+      : pkg.bin ? path.resolve(cwd, Object.values(pkg.bin)[0])
+      : null)
+    || path.join(cwd, 'index.js');
+} else {
+  entry = path.join(cwd, 'index.js');
+}
+
+if (!fs.existsSync(SHIM)) die(`plugin-shim.js not found at ${SHIM}`);
+if (!fs.existsSync(entry)) die(`entry point not found: ${entry}`);
+
+// --rme spawn ------------------------------------------------------------------
+
+const nodeArgs = ['--require', SHIM, entry, ...extraArgs];
+const result = spawnSync(process.execPath, nodeArgs, {
+  cwd,
+  stdio: 'inherit',
+  env: { ...process.env, BUN_INVOCATION_DIR: cwd },
+});
+process.exit(result.status ?? 1);
