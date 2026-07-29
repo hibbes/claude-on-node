@@ -55,6 +55,7 @@ let src = fs.readFileSync(bundlePath, 'utf8');
 //     Bun.TOML.parse                -> smol-toml (lazy; dates -> source-text strings)
 //     Bun.semver.{order,satisfies}  -> semver package
 //     Bun.Terminal + Bun.spawn(opts.terminal:T) -> node-pty
+//     Bun.spawn (non-PTY)           -> child_process (bg workers, rg probe)
 //     Bun.stringWidth               -> string-width@4 (ASCII fast path + memo cache)
 //     Bun.stripANSI                 -> strip-ansi@6
 //     Bun.wrapAnsi                  -> wrap-ansi@7
@@ -129,7 +130,170 @@ class _BunTerminalShim {
   }
 }
 
-const _bunShim_spawn = (argv, opts = {}) => {
+// --- Bun.spawn non-PTY shim (child_process-backed Subprocess subset) ---------
+// Until 2026-07-29 the non-PTY branch of Bun.spawn was a throws-stub ("no such
+// call site exists today", true when written in May). Site drift then did what
+// the mapping analysis of 2026-07-14 predicted: 2.1.220 spawns its background
+// workers (bg-pty-host, spare pool, bridge sessions) through non-PTY Bun.spawn,
+// and once that subsystem activated, the stub crashed every worker spawn and
+// eventually session startup itself ("worker crashed … respawning" loop). The
+// audit cannot flag this class: Bun.spawn has been in SHIMMED_BUN since May,
+// and new call sites of a shimmed symbol are deliberately accepted.
+//
+// So per the standing policy (stub throws in normal operation -> build the
+// real shim), this is a child_process-backed implementation of the Subprocess
+// surface the 2.1.220 sites consume, plus the documented core options
+// (bun.com/docs/api/spawn):
+//   - argv array or {cmd: [...]} object form (_bunShim_spawnNormalize)
+//   - cwd/env/argv0/detached/windowsHide (map 1:1 to child_process)
+//   - stdio array or per-fd stdin/stdout/stderr; specs: "pipe"/"ignore"/
+//     "inherit", numeric fd (borrowed, left open), BunFile (opened HERE so an
+//     open failure throws synchronously out of Bun.spawn with err.code, which
+//     the bg-pty-host site catches as its breadcrumb-degradation path; our own
+//     fds are closed after spawn, the child holds duplicates)
+//   - per-fd defaults per the docs: stdin "ignore", stdout "pipe", stderr "inherit"
+//   - Subprocess: pid, exited, exitCode, signalCode, killed, kill(), ref(),
+//     unref(), stdout/stderr as REAL web ReadableStreams (toWeb) with Bun's
+//     text()/json()/bytes()/arrayBuffer() readers attached, stdin as a
+//     FileSink subset (write/flush/end), onExit callback, timeout+killSignal
+//   - ipc/serialization throw loudly: half an IPC channel would be a landmine
+// KNOWN LIMITS, pinned in test/spawn-shim.test.js: a missing executable
+// resolves exited to -1 with a stderr warning instead of Bun's synchronous
+// throw (child_process reports ENOENT async; an unhandled 'error' event would
+// crash the host process, the very failure mode this shim removes), and a
+// signal death resolves exited to 128+signum (Bun's value is undocumented and
+// unverifiable here; callers only compare against 0).
+const _bunShim_spawnNormalize = (argvOrOpts, opts) => {
+  if (!Array.isArray(argvOrOpts) && argvOrOpts && Array.isArray(argvOrOpts.cmd)) {
+    return [argvOrOpts.cmd, argvOrOpts];
+  }
+  return [argvOrOpts, opts || {}];
+};
+
+const _bunShim_spawnStdioToNode = (spec, ioDir, ownFds) => {
+  if (spec === undefined || spec === null) return undefined; // caller applies per-fd default
+  if (spec === 'pipe' || spec === 'ignore' || spec === 'inherit') return spec;
+  if (typeof spec === 'number') return spec; // borrowed fd: child gets a dup, we leave it open
+  if (spec instanceof Blob) {
+    // BunFile target (the bg-pty-host stderr breadcrumb). Open synchronously so
+    // errno failures throw out of Bun.spawn itself, as the call site expects.
+    if (spec._fd !== undefined) return spec._fd; // fd-backed BunFile: borrowed
+    const fd = fs.openSync(spec._path ?? spec.name, ioDir === 'in' ? 'r' : 'w');
+    ownFds.push(fd);
+    return fd;
+  }
+  throw new Error(`Bun.spawn stdio spec not supported under Node shim: ${Object.prototype.toString.call(spec)}`);
+};
+
+const _bunShim_spawnReadable = (nodeStream) => {
+  if (!nodeStream) return undefined;
+  const web = require('stream').Readable.toWeb(nodeStream);
+  // Bun extends ReadableStream with convenience readers (the rg version probe
+  // does `await proc.stdout.text()`). Attach them as own properties; the
+  // object stays a real ReadableStream (getReader/tee/pipeTo keep working).
+  web.text = () => new Response(web).text();
+  web.json = () => new Response(web).json();
+  web.arrayBuffer = () => new Response(web).arrayBuffer();
+  web.bytes = () => new Response(web).arrayBuffer().then((b) => new Uint8Array(b));
+  return web;
+};
+
+const _bunShim_spawnNonPty = (argv, opts = {}) => {
+  if (!Array.isArray(argv) || argv.length === 0 || typeof argv[0] !== 'string') {
+    throw new Error('Bun.spawn shim: cmd must be a non-empty array of strings');
+  }
+  if (opts.ipc !== undefined || opts.serialization !== undefined) {
+    throw new Error('Bun.spawn({ipc}) not supported under Node shim');
+  }
+  const cp = require('child_process');
+  const ownFds = [];
+  let child;
+  try {
+    const stdio = Array.isArray(opts.stdio)
+      ? opts.stdio.map((s, i) =>
+          _bunShim_spawnStdioToNode(s, i === 0 ? 'in' : 'out', ownFds) ?? 'ignore')
+      : [
+          _bunShim_spawnStdioToNode(opts.stdin, 'in', ownFds) ?? 'ignore',
+          _bunShim_spawnStdioToNode(opts.stdout, 'out', ownFds) ?? 'pipe',
+          _bunShim_spawnStdioToNode(opts.stderr, 'out', ownFds) ?? 'inherit',
+        ];
+    child = cp.spawn(argv[0], argv.slice(1), {
+      cwd: opts.cwd,
+      env: opts.env,
+      argv0: opts.argv0,
+      detached: !!opts.detached,
+      windowsHide: !!opts.windowsHide,
+      stdio,
+    });
+  } finally {
+    // child_process duplicates stdio fds during the synchronous spawn call, so
+    // fds WE opened (BunFile targets) are closed here either way; borrowed
+    // numeric fds are the caller's and stay open (site 5 closes its own).
+    for (const fd of ownFds) { try { fs.closeSync(fd); } catch (_) {} }
+  }
+
+  let exitCode = null;
+  let signalCode = null;
+  let resolveExit;
+  const exited = new Promise((res) => { resolveExit = res; });
+  const subprocess = {
+    get pid() { return child.pid; },
+    exited,
+    get exitCode() { return exitCode; },
+    get signalCode() { return signalCode; },
+    get killed() { return child.killed; },
+    kill(sig) { try { child.kill(sig || 'SIGTERM'); } catch (_) {} },
+    ref() { child.ref(); },
+    unref() { child.unref(); },
+    stdout: _bunShim_spawnReadable(child.stdout),
+    stderr: _bunShim_spawnReadable(child.stderr),
+    stdin: child.stdin ? {
+      write(chunk) {
+        const buf = typeof chunk === 'string' ? chunk
+          : ArrayBuffer.isView(chunk) ? Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+          : chunk instanceof ArrayBuffer ? Buffer.from(chunk)
+          : String(chunk);
+        child.stdin.write(buf);
+        return buf.length;
+      },
+      flush() { return 0; }, // Node Writable has no explicit flush; write is queued
+      end() { try { child.stdin.end(); } catch (_) {} return 0; },
+    } : undefined,
+  };
+
+  const settle = (code, signal, err) => {
+    signalCode = signal || null;
+    if (err || (code === null && !signal)) exitCode = -1;
+    else if (code !== null) exitCode = code;
+    // exitCode stays null on a signal death, per Bun's documented "null until
+    // the process exits normally"; exited still resolves non-zero (128+n).
+    const sigNum = signal ? (os.constants.signals[signal] || 0) : 0;
+    resolveExit(err ? -1 : (code !== null ? code : 128 + sigNum));
+    if (typeof opts.onExit === 'function') {
+      try { opts.onExit(subprocess, exitCode, signalCode, err || undefined); } catch (_) {}
+    }
+  };
+  child.once('error', (err) => {
+    // Bun throws synchronously for a missing executable; child_process emits
+    // an async 'error' event, which unhandled would crash the WHOLE host
+    // process. Degrade instead: warn once, resolve exited with -1 (callers
+    // compare against 0 and treat the probe as failed).
+    process.stderr.write(`[claude-on-node] Bun.spawn shim: ${err && err.message ? err.message : err}\n`);
+    settle(null, null, err || new Error('spawn failed'));
+  });
+  child.once('exit', (code, signal) => settle(code, signal, null));
+
+  if (typeof opts.timeout === 'number' && opts.timeout > 0) {
+    const t = setTimeout(() => subprocess.kill(opts.killSignal || 'SIGTERM'), opts.timeout);
+    t.unref();
+    exited.finally(() => clearTimeout(t)); // exited never rejects; no unhandled here
+  }
+  return subprocess;
+};
+// --- end Bun.spawn non-PTY shim -------------------------------------------------
+
+const _bunShim_spawn = (argvOrOpts, optsIn = {}) => {
+  const [argv, opts] = _bunShim_spawnNormalize(argvOrOpts, optsIn);
   if (opts && opts.terminal && opts.terminal.__isBunTerminalShim) {
     const term = opts.terminal;
     const ptyMod = bundleRequire('node-pty');
@@ -159,7 +323,7 @@ const _bunShim_spawn = (argv, opts = {}) => {
       },
     };
   }
-  throw new Error('Bun.spawn called under Node without PTY shim (unexpected non-PTY call site)');
+  return _bunShim_spawnNonPty(argv, opts);
 };
 
 // FNV-1a 64-bit. Matches Bun.hash's "numeric value with .toString()" surface
@@ -302,8 +466,8 @@ const _bunShim_deepEquals = (a, b, strict = false) => {
 
 // --- Bun.file shim (lazy BunFile subset backed by Node fs) -------------------
 // 2.1.201's sole call site is `Bun.file(<ptySock>.err)` as a spawn-stdio stderr
-// target in the bg-pty-host spawner (a path our non-terminal Bun.spawn shim
-// rejects anyway), so nothing consumes the object today. Still a REAL fs-backed
+// target in the bg-pty-host spawner (served since 2026-07-29 by the non-PTY
+// Bun.spawn shim, which opens the file synchronously). Also a REAL fs-backed
 // implementation rather than a throws-stub: once a symbol is in SHIMMED_BUN the
 // audit stops flagging its new call sites, and Bun.file is Bun's most central
 // file API; future releases will grow more sites (.text()/.json()/.exists()
