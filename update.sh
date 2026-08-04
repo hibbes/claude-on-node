@@ -490,9 +490,19 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     exit 0
 fi
 
-log "Backing up current bundle…"
-cp "$CLAUDE_NODE_DIR/bundle.js" "$CLAUDE_NODE_DIR/bundle.js.v${CURRENT}.bak"
-log "  → bundle.js.v${CURRENT}.bak"
+# NOTE: on a fresh clone / first-time deploy, package.json can already record
+# a version (e.g. committed by whoever last maintained the tree) while
+# bundle.js has never actually been written to disk on THIS machine. In that
+# case CURRENT == VERSION is possible too (handled above by --force), but even
+# on a genuine version bump there may simply be no prior bundle.js yet. Guard
+# the backup so first-time deploys don't abort on a missing source file.
+if [[ -f "$CLAUDE_NODE_DIR/bundle.js" ]]; then
+    log "Backing up current bundle…"
+    cp "$CLAUDE_NODE_DIR/bundle.js" "$CLAUDE_NODE_DIR/bundle.js.v${CURRENT}.bak"
+    log "  → bundle.js.v${CURRENT}.bak"
+else
+    log "No existing bundle to back up (first-time deploy)."
+fi
 
 # Rotate bundle backups to the newest 5, mirroring the log rotation above.
 # Unbounded, this had grown to 59 files / 916 MB by 2026-07-19, gaining
@@ -538,6 +548,46 @@ log "Bumping global npm package too (for version-reporting parity)…"
 if ! npm i -g "@anthropic-ai/claude-code@${VERSION}" >/dev/null 2>&1; then
     warn "Global npm install failed — not fatal, claude-node will still work."
 fi
+
+# --- plugin support -----------------------------------------------------------
+maybe_setup_plugins() {
+    local shim="$CLAUDE_NODE_DIR/plugin-shim.js"
+    local dispatcher="$CLAUDE_NODE_DIR/bin/bun"
+    if ! [[ -f "$shim" ]]; then
+        warn "plugin-shim.js not found — plugin subprocess support will not work."
+        return
+    fi
+    if ! [[ -x "$dispatcher" ]]; then
+        chmod +x "$dispatcher" 2>/dev/null || true
+    fi
+    # Validate the shim can load (spawn a quick probe, don't --require on this
+    # shell's node — a broken shim printed a diagnostic that users miss in CI).
+    if node -e "
+        require('fs').readFileSync('${shim}','utf8').indexOf('globalThis.__bunShim = {') > -1
+    " 2>/dev/null; then
+        :
+    else
+        warn "plugin-shim.js looks damaged — it does not contain the expected __bunShim marker."
+        warn "  Check $shim and re-deploy if needed."
+        return
+    fi
+    log "  ✓ plugin-shim.js present"
+
+    # Suggest PATH setup for the bun dispatcher if it isn't already on PATH.
+    local bun_resolved
+    bun_resolved="$(command -v bun 2>/dev/null || true)"
+    if [[ -z "$bun_resolved" ]]; then
+        log "  Plugin support: symlink bin/bun into your PATH."
+        log "    ln -s $dispatcher ~/.local/bin/bun"
+    elif [[ "$bun_resolved" != "$dispatcher" ]]; then
+        log "  Note: existing 'bun' on PATH ($bun_resolved) is not our dispatcher."
+        log "    If Claude Code plugins should route through Node, symlink our version:"
+        log "    ln -sf $dispatcher ~/.local/bin/bun"
+    else
+        log "  ✓ bun dispatcher on PATH"
+    fi
+}
+maybe_setup_plugins
 
 log "✅ Updated $CURRENT → $VERSION"
 log "   Backup: $CLAUDE_NODE_DIR/bundle.js.v${CURRENT}.bak"

@@ -41,14 +41,31 @@ Also needed: `objcopy` (binutils) and `npm` for the updater.
   bundle.js              # extracted JS bundle (gitignored, fetched per release)
   bundle.js.v*.bak       # rollback backups (gitignored)
   launcher.js            # Node loader + Bun shim
+  plugin-shim.js         # Bun API shim for plugin subprocesses (--require'd)
   update.sh              # updater (symlinked as claude-node-update in PATH)
   package.json           # deps: Bun-shim backers + the bundle's own require() targets
   package-lock.json      # pinned dependency tree
+  bin/
+    bun                  # bun PATH dispatcher for plugin subprocesses
   test/                  # shim + invariant tests, `npm test` (no framework, no dev deps)
   logs/                  # per-run updater logs (gitignored, last 20 + latest.log)
 ```
 
 The recommended setup keeps the working tree at `~/.claude-node/` and a wrapper script `claude-node` (PATH) that does `node ~/.claude-node/launcher.js "$@"`.
+
+## Plugin subprocess support
+
+Claude Code plugins spawn subprocesses with `bun run --cwd <plugin-dir>`. On machines without a working Bun binary this fails. Two files provide a Bun-free path:
+
+- **`bin/bun`** — A `bun` PATH dispatcher that intercepts `bun run --cwd <dir>` and runs the plugin entry point under `node` with `--require` pointing to the plugin shim. Symlink to a PATH directory:
+  ```sh
+  ln -s ~/.claude-node/bin/bun ~/.local/bin/bun
+  ```
+  Supports `bun run --cwd <dir>` (resolves `main`/`bin` from `package.json`), `bun run --cwd <dir> <file> [args...]`, `bun --version`, and `bun --help`.
+
+- **`plugin-shim.js`** — Loaded via `node --require`, this reads `launcher.js` from the same directory, evals its preamble and all shim blocks (stopping before the source-replace + bundle eval), then defines `globalThis.Bun` so plugin code can call `Bun.X` directly. Because the shim code comes from the same `launcher.js` the main CLI uses, any new Bun symbol shimmed in a future update is automatically available to plugins — no extra maintenance.
+
+  Unlike the main launcher's source-replace strategy (which keeps `typeof Bun<"u"` guards working by only rewriting specific symbols), plugin subprocesses are fresh Node processes that never see the bundle's `typeof Bun` guards. Defining the full `globalThis.Bun` object is correct here — plugins just need `Bun.file`, `Bun.YAML`, etc. to resolve.
 
 ## Bun shim coverage
 
@@ -108,6 +125,7 @@ No test framework and no dev dependencies, and `bundle.js` is not needed (the su
 - **`test/bunfile-shim.test.js`** covers the `Bun.file` shim (55 cases): input forms, lazy construction, positioned `fd` reads, MIME mapping, `writer()`, `stream()`, and the deliberate `slice()` throw.
 - **`test/toml-shim.test.js`** covers the `Bun.TOML` shim (51 cases), including the documented limits of the date round-trip.
 - **`test/spawn-shim.test.js`** covers the non-PTY `Bun.spawn` shim (20 cases, POSIX-only): the exact shapes of the bundle's call sites (rg probe, bg-pty-host breadcrumb, spare pool), stream readers, fd ownership, signal/ENOENT degradation, and a guard that fails loudly if an `unref()`d child drains the event loop before the report runs.
+- **`test/plugin-shim.test.js`** verifies that loading `plugin-shim.js` via `node --require` correctly sets up `globalThis.Bun` with the shimmed API surface (26 probes: namespace presence, YAML round-trip, file construction, hash, inert values, throw-on-use symbols, and Bun.ant members).
 
 A lazily required shim backer is invisible to **both** deploy gates: the dep audit reads `require()` targets out of `bundle.js` only, so a launcher-side package never appears in it, and the smoke test exercises only the eager requires at the top of `launcher.js`. `smol-toml` and `node-pty` are both lazy, so `npm ci`, `npm prune`, a partial `node_modules` restore or a fresh machine could produce a tree that passes every audit and both smoke probes and then fails when a user runs `claude import` or opens a background terminal. `update.sh` therefore asserts backer resolvability before the smoke test, and `npm test` asserts it too.
 
