@@ -17,6 +17,17 @@ const fs = require('fs');
 const path = require('path');
 
 const LAUNCHER = path.join(__dirname, 'launcher.js');
+
+// launcher.js's preamble reads bundle.js into a variable (it is never run
+// here -- we stop before the bundle eval), but the read still needs the file
+// to exist. On a fresh clone before the first deploy there is no bundle.js
+// yet; fail with a clear message instead of a raw fs ENOENT stacktrace.
+const BUNDLE = path.join(__dirname, 'bundle.js');
+if (!fs.existsSync(BUNDLE)) {
+  console.error(`FATAL [plugin-shim]: bundle.js not found at ${BUNDLE}.`);
+  console.error('  Deploy first (run update.sh); then plugin subprocesses will work.');
+  process.exit(1);
+}
 let launcherSrc = fs.readFileSync(LAUNCHER, 'utf8');
 // Strip the shebang — new Function('<script>' ) rejects #! as an invalid token.
 if (launcherSrc.startsWith('#!')) launcherSrc = '// ' + launcherSrc.slice(2);
