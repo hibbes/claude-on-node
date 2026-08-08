@@ -10,13 +10,15 @@
 // for: it SIGILLs, so no shim is ever verifiable against the real runtime).
 // Bun.ant is not even public Bun: it is a namespace of Anthropic-private
 // natives in their custom Bun build, undocumented anywhere. What IS observable
-// is the 2.1.219 bundle's own use of it, and both call sites sit in try/catch
-// with an explicit degradation path:
+// is the bundle's own use of it, and every call site sits in try/catch with an
+// explicit degradation path:
 //   - Bun.ant.getPeerUid(fd): catch -> warn "peer uid lookup failed" + null
+//   - Bun.ant.getPeerPid(fd): catch -> warn "peer pid lookup failed" + return
 //   - Bun.ant.setDumpable(false): catch -> log "prctl unavailable" + continue
-// Under 2.1.218 the same two paths went through bun:ffi, whose require()
-// throws under Node into those same catches. Throwing is therefore the
-// behavior-preserving shim, and these tests pin exactly that contract.
+// getPeerUid and setDumpable migrated from bun:ffi paths (pre-2.1.219) whose
+// require() throws under Node into those same catches; getPeerPid arrived later
+// (2.1.226) with the identical degrade-on-throw contract. Throwing is therefore
+// the behavior-preserving shim, and these tests pin exactly that contract.
 
 const fs = require('fs');
 const path = require('path');
@@ -63,6 +65,8 @@ check('getPeerUid throws with member name', () =>
   throwsWith(() => ant.getPeerUid(3), 'Bun.ant.getPeerUid', 'not supported under Node'));
 check('setDumpable throws with member name', () =>
   throwsWith(() => ant.setDumpable(false), 'Bun.ant.setDumpable', 'not supported under Node'));
+check('getPeerPid throws with member name', () =>
+  throwsWith(() => ant.getPeerPid(3), 'Bun.ant.getPeerPid', 'not supported under Node'));
 
 // --- 2. the bundle's own call-site contracts keep working --------------------
 // sjb() (daemon peer-uid check): try { return Bun.ant.getPeerUid(t) } catch { warn; return null }
@@ -70,6 +74,13 @@ check('daemon call-site degradation: catch yields null', () => {
   let r;
   try { r = ant.getPeerUid(42); } catch (_) { r = null; }
   return r === null;
+});
+// fBa() (peer-cred pid check): try { r = Bun.ant.getPeerPid(t); if(r>0) return r;
+// warn; return } catch { warn; return } — a throw must reach the catch, not escape.
+check('peer-cred call-site degradation: throw reaches the catch', () => {
+  let reached = false;
+  try { ant.getPeerPid(42); } catch (_) { reached = true; }
+  return reached;
 });
 // iSm() (dump hardening): try { if(!Bun.ant.setDumpable(!1)) log(...) } catch(t) { log("prctl unavailable: " + t.message) }
 check('hardening call-site degradation: catch sees an Error', () => {
@@ -97,11 +108,12 @@ check('unknown member read throws even without a call', () => {
 // `"x" in Bun.ant` probe must keep returning false for members we don't have,
 // not throw, so a future guarded call site degrades instead of crashing.
 check('"getPeerUid" in ant is true', () => 'getPeerUid' in ant);
+check('"getPeerPid" in ant is true', () => 'getPeerPid' in ant);
 check('"setDumpable" in ant is true', () => 'setDumpable' in ant);
 check('unknown member is not `in` ant', () => !('futureNativeThing' in ant));
 check('Object.keys lists exactly the known members', () => {
   const k = Object.keys(ant).sort().join(',');
-  return k === 'getPeerUid,setDumpable';
+  return k === 'getPeerPid,getPeerUid,setDumpable';
 });
 
 // --- 5. generic object protocols must NOT trip the smoke alarm ---------------

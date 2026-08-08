@@ -412,7 +412,7 @@ log "Bun.ant member audit…"
 # test/lockstep.test.js enforces that pairing. Runtime backstop for spellings
 # this text-level scan cannot see (minifier aliasing like `let a=Bun.ant`):
 # the shim Proxy throws loudly on any unknown member read.
-ANT_MEMBERS=( getPeerUid setDumpable )
+ANT_MEMBERS=( getPeerUid getPeerPid setDumpable )
 mapfile -t ANT_HITS < <(
 python3 - <<'PY'
 import re

@@ -178,6 +178,11 @@ check('Bun.ant.getPeerUid throws', () => {
   return out === 'threw';
 });
 
+check('Bun.ant.getPeerPid throws', () => {
+  const out = probe(`try { Bun.ant.getPeerPid(0); console.log("no throw"); } catch(e) { console.log("threw"); }`);
+  return out === 'threw';
+});
+
 check('Bun.ant.setDumpable throws', () => {
   const out = probe(`try { Bun.ant.setDumpable(false); console.log("no throw"); } catch(e) { console.log("threw"); }`);
   return out === 'threw';

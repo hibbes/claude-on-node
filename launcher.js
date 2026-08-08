@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Run Claude Code 2.1.220's JS bundle under Node (no Bun needed).
+// Run Claude Code 2.1.226's JS bundle under Node (no Bun needed).
 // The bundle is a CJS IIFE expression: (function(exports,require,module,__filename,__dirname){...})
 // Node doesn't auto-invoke it, so we read + eval + call with module context.
 
@@ -75,7 +75,7 @@ let src = fs.readFileSync(bundlePath, 'utf8');
 //
 //   Anthropic-private native namespace (Proxy: known members throw on call,
 //   unknown member READS throw too; see the Bun.ant shim block):
-//     Bun.ant.{getPeerUid,setDumpable}  (SO_PEERCRED / prctl; ex-bun:ffi paths)
+//     Bun.ant.{getPeerUid,getPeerPid,setDumpable}  (SO_PEERCRED / prctl; ex-bun:ffi paths)
 const bundleRequire = Module.createRequire(bundlePath);
 const yamlMod = bundleRequire('yaml');
 const semverMod = bundleRequire('semver');
@@ -760,10 +760,14 @@ const _bunShim_stringWidth = _bunShim_makeStringWidth(bundleRequire('string-widt
 
 // --- Bun.ant shim (Anthropic-private native namespace, throws per member) ----
 // v2.1.219 introduced `Bun.ant`, a namespace of Anthropic-private natives in
-// their custom Bun build, with two members at two call sites:
+// their custom Bun build. Every member sits at a call site that degrades
+// in-bundle when the native throws:
 //   - Bun.ant.getPeerUid(fd): SO_PEERCRED peer-uid lookup on the
 //     com.anthropic.claude-daemon socket; the caller catches, warns
 //     "[daemon] peer uid lookup failed" and returns null.
+//   - Bun.ant.getPeerPid(fd): SO_PEERCRED peer-pid lookup on the same socket
+//     (added v2.1.226); the caller catches, warns "[peer-cred] peer pid
+//     lookup failed" and returns undefined.
 //   - Bun.ant.setDumpable(false): prctl(PR_SET_DUMPABLE, 0) hardening; the
 //     caller catches and logs "prctl unavailable".
 // Node core exposes neither syscall, and under 2.1.218 the same two paths went
@@ -789,6 +793,10 @@ const _bunShim_antMembers = {
   getPeerUid(_fd) {
     throw new Error('Bun.ant.getPeerUid (SO_PEERCRED) not supported under Node; '
       + 'the daemon peer-uid check degrades in-bundle (warn + null), as it did via bun:ffi before 2.1.219');
+  },
+  getPeerPid(_fd) {
+    throw new Error('Bun.ant.getPeerPid (SO_PEERCRED) not supported under Node; '
+      + 'the peer-cred pid check degrades in-bundle (warn + undefined), added 2.1.226');
   },
   setDumpable(_flag) {
     throw new Error('Bun.ant.setDumpable (prctl PR_SET_DUMPABLE) not supported under Node; '
