@@ -14,6 +14,13 @@ const os = require('os');
 // triggers the system-rg lookup via `which`.
 if (process.env.USE_BUILTIN_RIPGREP === undefined) process.env.USE_BUILTIN_RIPGREP = '0';
 
+// Disable Claude Code's internal auto-updater. It migrates to a *native*
+// binary that needs SSE4.2/POPCNT; on the pre-POPCNT CPUs this project exists
+// for, that binary crashes with SIGILL and can clobber this workaround dir.
+// Updates come from redeploying the bundle (update.sh), not from the CLI.
+// See anthropics/claude-code#85571. An explicit env value still wins.
+if (process.env.DISABLE_AUTOUPDATER === undefined) process.env.DISABLE_AUTOUPDATER = '1';
+
 // The bundle contains `using` declarations (Explicit Resource Management).
 // V8 only parses that form from Node 24 onwards, and it is not gated to any
 // particular scope: on older Node the whole bundle fails, even though `using`

@@ -112,6 +112,8 @@ A separate `AUDIT_INERT_BUN` map in `update.sh` whitelists `Bun.*` symbols that 
 
 `launcher.js` also forces `USE_BUILTIN_RIPGREP=0` so the bundle uses the system `rg` via `which`, instead of a build-time-baked `/home/runner/work/...` path that doesn't exist on a real install.
 
+`launcher.js` also sets `DISABLE_AUTOUPDATER=1` (unless already set). Claude Code's internal auto-updater migrates to a native binary that requires SSE4.2/POPCNT; on the pre-POPCNT CPUs this project targets it crashes with SIGILL and can overwrite this workaround directory. Update by redeploying the bundle with `update.sh`, not via the CLI. See anthropics/claude-code#85571.
+
 ### Tests
 
 ```
