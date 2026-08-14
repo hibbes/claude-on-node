@@ -57,7 +57,7 @@ const throwsWith = (fn, ...needles) => {
   }
 };
 
-// --- 1. the two known members throw, and say what and why --------------------
+// --- 1. the known members throw, and say what and why ----------------------
 // The message must name the member (so the log line a user reports is
 // self-locating) and say "not supported under Node" (the phrasing every other
 // stub in launcher.js uses).
@@ -67,6 +67,8 @@ check('setDumpable throws with member name', () =>
   throwsWith(() => ant.setDumpable(false), 'Bun.ant.setDumpable', 'not supported under Node'));
 check('getPeerPid throws with member name', () =>
   throwsWith(() => ant.getPeerPid(3), 'Bun.ant.getPeerPid', 'not supported under Node'));
+check('memoryPressureLevel throws with member name', () =>
+  throwsWith(() => ant.memoryPressureLevel(), 'Bun.ant.memoryPressureLevel', 'not supported under Node'));
 
 // --- 2. the bundle's own call-site contracts keep working --------------------
 // sjb() (daemon peer-uid check): try { return Bun.ant.getPeerUid(t) } catch { warn; return null }
@@ -87,6 +89,13 @@ check('hardening call-site degradation: catch sees an Error', () => {
   try { ant.setDumpable(false); return false; } catch (t) {
     return t instanceof Error && t.message.length > 0;
   }
+});
+// m$S() (bg low-mem, macOS-only): try { e=Bun.ant.memoryPressureLevel(); return e===null?void 0:enm[e] }
+// catch { warn "bg low-mem: memoryPressureLevel failed"; return } — a throw degrades to undefined.
+check('bg low-mem call-site degradation: catch yields undefined', () => {
+  let r = 'sentinel';
+  try { r = ant.memoryPressureLevel(); } catch (_) { r = undefined; }
+  return r === undefined;
 });
 
 // --- 3. unknown members throw on READ, not just on call ----------------------
@@ -110,10 +119,11 @@ check('unknown member read throws even without a call', () => {
 check('"getPeerUid" in ant is true', () => 'getPeerUid' in ant);
 check('"getPeerPid" in ant is true', () => 'getPeerPid' in ant);
 check('"setDumpable" in ant is true', () => 'setDumpable' in ant);
+check('"memoryPressureLevel" in ant is true', () => 'memoryPressureLevel' in ant);
 check('unknown member is not `in` ant', () => !('futureNativeThing' in ant));
 check('Object.keys lists exactly the known members', () => {
   const k = Object.keys(ant).sort().join(',');
-  return k === 'getPeerPid,getPeerUid,setDumpable';
+  return k === 'getPeerPid,getPeerUid,memoryPressureLevel,setDumpable';
 });
 
 // --- 5. generic object protocols must NOT trip the smoke alarm ---------------

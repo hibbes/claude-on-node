@@ -188,6 +188,11 @@ check('Bun.ant.setDumpable throws', () => {
   return out === 'threw';
 });
 
+check('Bun.ant.memoryPressureLevel throws', () => {
+  const out = probe(`try { Bun.ant.memoryPressureLevel(); console.log("no throw"); } catch(e) { console.log("threw"); }`);
+  return out === 'threw';
+});
+
 // --- 9. source-replace is NOT applied (plugin context) ------------------------
 // In the plugin context, Bun.X references stay as-is (no __bunShim rewrite).
 // Verify that the raw name `Bun.file` still resolves after --require.

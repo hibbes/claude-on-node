@@ -213,27 +213,41 @@ objcopy --dump-section .bun=claude.bun package/claude 2>/dev/null \
 
 log "Extracting JS bundle (anchored to cli.js header)…"
 # Pre-2.1.133 the cli.js bundle sat at fixed offset 0x1b0 in the .bun section.
-# v2.1.133 prepends ~111 MB of precompiled bytecode and packs extra worker
-# bundles (image-processor.js, audio-capture.js) into the same section, so the
-# offset now floats. Anchor on the bunfs path immediately followed by the
-# `// @bun` header — the worker bundles carry the same `// @bun` marker but
-# different path prefixes, so the path is what disambiguates.
+# v2.1.133 prepended precompiled bytecode and packed extra worker bundles
+# (image-processor.js, audio-capture.js) into the same section, so the offset
+# floats; we anchor on the cli.js entrypoint path. v2.1.232 then inserted a
+# second NUL-separated path entry (the `/$bunfs/root/cli` short-name alias)
+# BETWEEN the cli.js path and its `// @bun` header, so the old adjacency anchor
+# (`cli.js\0// @bun`) stopped matching. Robust fix: find the cli.js entrypoint
+# path whose `// @bun` header sits within a short window (skipping any
+# NUL-separated sibling alias paths). Requiring the header nearby rules out both
+# the early `file://…/cli.js` string in the header table (its `// @bun` is
+# ~200 MB downstream) and a worker bundle that might reorder ahead of cli.js
+# (its header belongs to a different path entirely).
 python3 - <<'PY'
 data = open('claude.bun', 'rb').read()
-prefix = b'/$bunfs/root/src/entrypoints/cli.js\x00'
-i = data.find(prefix + b'// @bun')
-if i == -1:
-    raise SystemExit("cli.js bundle marker not found in .bun section "
-                     "(expected '/$bunfs/root/src/entrypoints/cli.js\\0// @bun')")
-start = i + len(prefix)
+anchor = b'/$bunfs/root/src/entrypoints/cli.js'
+start = None
+p = 0
+while True:
+    p = data.find(anchor, p)
+    if p == -1:
+        break
+    m = data.find(b'// @bun', p)
+    if m != -1 and 0 <= m - p < 128:
+        start = m
+        break
+    p += 1
+if start is None:
+    raise SystemExit("cli.js '// @bun' header not found in .bun section "
+                     "(expected '/$bunfs/root/src/entrypoints/cli.js' followed by "
+                     "'// @bun' within 128 bytes; .bun layout changed again?)")
 # Entries in the .bun section are NUL-separated: the cli.js payload is followed
-# by \x00 and then the next path ("\x00/$bunfs/root/image-processor.js\x00//
-# @bun"). Cut on that terminator. The previous boundary scanned forward while
-# bytes stayed printable ASCII, which lands on the same offset only because Bun
-# currently escapes non-ASCII to \uXXXX: one raw byte >= 0x80 anywhere in the
-# bundle would have cut it short there, and a truncation whose last 8 bytes
-# happen to contain "})" slips past the trailer check below (~1.6% of cut
-# points). Verified identical output on 2.1.113 / .133 / .167 / .206 / .212.
+# by \x00 and then the next path. Cut on that terminator. NUL-termination is
+# safe because minified JS escapes any literal NUL (\x00 / \0 / \uXXXX) in its
+# source text, so a raw 0x00 byte never appears inside the bundle. A truncation
+# whose last 8 bytes happen to contain "})" would slip past the trailer check
+# below (~1.6% of cut points), so this relies on that no-raw-NUL invariant.
 end = data.find(b'\x00', start)
 if end == -1:
     raise SystemExit("no NUL terminator after the cli.js bundle "
@@ -412,7 +426,7 @@ log "Bun.ant member audit…"
 # test/lockstep.test.js enforces that pairing. Runtime backstop for spellings
 # this text-level scan cannot see (minifier aliasing like `let a=Bun.ant`):
 # the shim Proxy throws loudly on any unknown member read.
-ANT_MEMBERS=( getPeerUid getPeerPid setDumpable )
+ANT_MEMBERS=( getPeerUid getPeerPid setDumpable memoryPressureLevel )
 mapfile -t ANT_HITS < <(
 python3 - <<'PY'
 import re

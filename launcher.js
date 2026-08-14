@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Run Claude Code 2.1.226's JS bundle under Node (no Bun needed).
+// Run Claude Code 2.1.232's JS bundle under Node (no Bun needed).
 // The bundle is a CJS IIFE expression: (function(exports,require,module,__filename,__dirname){...})
 // Node doesn't auto-invoke it, so we read + eval + call with module context.
 
@@ -82,7 +82,7 @@ let src = fs.readFileSync(bundlePath, 'utf8');
 //
 //   Anthropic-private native namespace (Proxy: known members throw on call,
 //   unknown member READS throw too; see the Bun.ant shim block):
-//     Bun.ant.{getPeerUid,getPeerPid,setDumpable}  (SO_PEERCRED / prctl; ex-bun:ffi paths)
+//     Bun.ant.{getPeerUid,getPeerPid,setDumpable,memoryPressureLevel}  (SO_PEERCRED / prctl / macOS mem-pressure)
 const bundleRequire = Module.createRequire(bundlePath);
 const yamlMod = bundleRequire('yaml');
 const semverMod = bundleRequire('semver');
@@ -777,10 +777,15 @@ const _bunShim_stringWidth = _bunShim_makeStringWidth(bundleRequire('string-widt
 //     lookup failed" and returns undefined.
 //   - Bun.ant.setDumpable(false): prctl(PR_SET_DUMPABLE, 0) hardening; the
 //     caller catches and logs "prctl unavailable".
-// Node core exposes neither syscall, and under 2.1.218 the same two paths went
-// through bun:ffi, whose require() throws under Node into those same catches.
+//   - Bun.ant.memoryPressureLevel(): macOS libdispatch memory-pressure query
+//     (added v2.1.232); the caller catches, warns "bg low-mem:
+//     memoryPressureLevel failed" and returns undefined. macOS-only, on Linux
+//     the bg low-mem check takes the os.freemem() branch and never calls it.
+// Node core exposes none of these, and the SO_PEERCRED/prctl paths went through
+// bun:ffi before 2.1.219 (require() throws under Node into those same catches).
 // Throwing preserves that behavior exactly; a real implementation would need a
-// native FFI dep (koffi) for paths that already degrade by design.
+// native FFI dep (koffi, or macOS libdispatch) for paths that already degrade
+// by design.
 //
 // The namespace shape is the real hazard: the release audit's symbol regex
 // sees only `Bun.ant`, so with it in SHIMMED_BUN a future member
@@ -808,6 +813,10 @@ const _bunShim_antMembers = {
   setDumpable(_flag) {
     throw new Error('Bun.ant.setDumpable (prctl PR_SET_DUMPABLE) not supported under Node; '
       + 'the caller logs "prctl unavailable" and continues, as it did via bun:ffi before 2.1.219');
+  },
+  memoryPressureLevel() {
+    throw new Error('Bun.ant.memoryPressureLevel (macOS libdispatch memory pressure) not supported under Node; '
+      + 'the bg low-mem check is macOS-only (Linux takes the os.freemem() branch) and degrades in-bundle (warn + undefined), added 2.1.232');
   },
 };
 const _bunShim_ant = new Proxy(_bunShim_antMembers, {
