@@ -5,7 +5,7 @@
 // dispatcher (bin/bun) when spawning plugin subprocesses.
 //
 // Reads launcher.js from the same directory, evals its preamble and all
-// shim blocks (stopping before the source-replace + bundle eval), then
+// shim blocks (stopping before the module-graph loader is registered), then
 // copies globalThis.__bunShim to globalThis.Bun so plugin code can use
 // Bun.X directly without source-replacement.
 //
@@ -18,16 +18,9 @@ const path = require('path');
 
 const LAUNCHER = path.join(__dirname, 'launcher.js');
 
-// launcher.js's preamble reads bundle.js into a variable (it is never run
-// here -- we stop before the bundle eval), but the read still needs the file
-// to exist. On a fresh clone before the first deploy there is no bundle.js
-// yet; fail with a clear message instead of a raw fs ENOENT stacktrace.
-const BUNDLE = path.join(__dirname, 'bundle.js');
-if (!fs.existsSync(BUNDLE)) {
-  console.error(`FATAL [plugin-shim]: bundle.js not found at ${BUNDLE}.`);
-  console.error('  Deploy first (run update.sh); then plugin subprocesses will work.');
-  process.exit(1);
-}
+// launcher.js's preamble resolves the module-graph directory but never reads
+// it (the graph is loaded only past the point we stop at), so a fresh clone
+// without a deployed release can still --require this shim.
 let launcherSrc = fs.readFileSync(LAUNCHER, 'utf8');
 // Strip the shebang — new Function('<script>' ) rejects #! as an invalid token.
 if (launcherSrc.startsWith('#!')) launcherSrc = '// ' + launcherSrc.slice(2);
@@ -60,8 +53,9 @@ if (objEnd === -1) {
 // When this function executes:
 //  - require() resolves normally (including lazy bundleRequire deps like
 //    smol-toml and node-pty, which most plugins won't need)
-//  - __dirname is this file's directory, so bundle.js resolves correctly
-//  - The bundle never runs: we stop before the source-replace + eval
+//  - __dirname is this file's directory, so modules/ and node_modules
+//    resolve exactly as they do for the main CLI
+//  - The module graph never loads: we stop before the loader is registered
 //
 // After the function returns, closures in globalThis.__bunShim (arrow
 // functions capturing yamlMod, semverMod, etc.) keep those Module-scoped

@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
-# claude-node-update — extract a new Claude Code release's JS bundle from the
+# claude-node-update: extract a new Claude Code release's module graph from the
 # native Bun binary and deploy it under Node (Core2Duo has no AVX/POPCNT).
 #
-# Usage: claude-node-update [VERSION]        — upgrade to VERSION (default: latest)
-#        claude-node-update --dry-run        — run all audits, skip deploy
-#        claude-node-update --rollback       — restore most recent backup
-#        claude-node-update --list-backups   — list available backups
+# Usage: claude-node-update [VERSION]          upgrade to VERSION (default: latest)
+#        claude-node-update --dry-run          run all audits, skip deploy
+#        claude-node-update --rollback [V]     re-point modules/ at a kept release
+#        claude-node-update --list-backups     list kept releases (modules-*/)
+#        claude-node-update --no-global-npm    skip the global npm version bump
 #
-# Performs three safety checks before swapping the live bundle:
-#   1. External deps haven't changed (new require() targets → abort)
-#   2. No new unguarded Bun.* call sites (→ warn, require --force)
-#   3. Extracted bundle has expected header/trailer (→ abort on mismatch)
-# After deploy, runs a smoke test — auto-rolls back on failure.
+# Performs three safety checks before switching the live release:
+#   1. External deps haven't changed (new require() targets: abort)
+#   2. No new unguarded Bun.* call sites (warn, require --force)
+#   3. Extracted module graph is intact (manifest, entry, size: abort)
+# After deploy, runs a smoke test and auto-rolls back on failure.
 
 set -euo pipefail
 
-CLAUDE_NODE_DIR="${HOME}/.claude-node"
+# Overridable so a staging clone can be deployed to and smoke-tested in place.
+CLAUDE_NODE_DIR="${CLAUDE_NODE_DIR:-${HOME}/.claude-node}"
 FORCE=0
 DRY_RUN=0
+GLOBAL_NPM=1
 VERSION=""
 MODE="update"
 
@@ -25,10 +28,11 @@ for arg in "$@"; do
     case "$arg" in
         --force)         FORCE=1 ;;
         --dry-run)       DRY_RUN=1 ;;
+        --no-global-npm) GLOBAL_NPM=0 ;;
         --rollback)      MODE="rollback" ;;
         --list-backups)  MODE="list" ;;
         -h|--help)
-            sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *) VERSION="$arg" ;;
     esac
@@ -88,10 +92,14 @@ smoke_test() {
     # SIGTERM. Earlier "cold page cache" / "concurrent I/O" hypotheses were
     # wrong; the failures were 100 % reproducible with a TTY stdin and 0 % with
     # /dev/null stdin. The pre-warm cat below is harmless on Core2Duo and stays.
-    cat "$CLAUDE_NODE_DIR/bundle.js" > /dev/null 2>&1 || true
+    cat "$CLAUDE_NODE_DIR"/modules/*.js > /dev/null 2>&1 || true
 
+    # Probe the launcher in $CLAUDE_NODE_DIR directly rather than whatever
+    # `claude-node` on PATH points at: that is the tree this run deploys into,
+    # and it lets a staging clone be smoke-tested without touching PATH.
+    local launcher="$CLAUDE_NODE_DIR/launcher.js"
     local out rc
-    set +e; out="$(timeout 30 claude-node --version </dev/null 2>&1)"; rc=$?; set -e
+    set +e; out="$(timeout 30 node "$launcher" --version </dev/null 2>&1)"; rc=$?; set -e
     if [[ $rc -ne 0 ]]; then
         warn "Smoke test (--version) failed (exit $rc)"
         printf '=== BEGIN --version OUTPUT ===\n%s\n=== END --version OUTPUT ===\n' "$out" >&2
@@ -100,15 +108,16 @@ smoke_test() {
     fi
     log "  --version: $out"
 
-    # --help reads the 14 MB bundle into Node's eval and walks Commander's whole
-    # option tree (each option goes through Bun.stringWidth/wrapAnsi). With the
+    # --help links the entry's static import closure (~130 chunks) and walks
+    # Commander's whole option tree (each option goes through
+    # Bun.stringWidth/wrapAnsi). With the
     # </dev/null fix above this lands in ~4 s on this hardware; the 30 s first
     # budget plus 90 s retry are kept as belt-and-suspenders for unexpected
     # I/O contention, not for the (now-fixed) TTY hang.
     local attempt tmo
     for attempt in 1 2; do
         tmo=$(( attempt == 1 ? 30 : 90 ))
-        set +e; out="$(timeout "$tmo" claude-node --help </dev/null 2>&1)"; rc=$?; set -e
+        set +e; out="$(timeout "$tmo" node "$launcher" --help </dev/null 2>&1)"; rc=$?; set -e
         if [[ $rc -eq 0 ]] && grep -q 'Usage:' <<<"$out"; then
             log "  --help: ok ($(wc -l <<<"$out") lines, attempt ${attempt}/2)"
             return 0
@@ -124,35 +133,57 @@ smoke_test() {
     return 1
 }
 
+# Kept releases are modules-<version>/ directories; the live one is whatever
+# modules/ (a symlink) points at. Rollback re-points the link, so it is
+# instant and never copies. A release is never deleted while it is live, and
+# a running session keeps reading the directory it resolved at startup (the
+# launcher realpath()s the link once), so re-pointing under a session is safe.
+live_release() {
+    # Basename of the directory modules/ currently points at, or empty.
+    local t
+    t="$(readlink "$CLAUDE_NODE_DIR/modules" 2>/dev/null || true)"
+    [[ -n "$t" ]] && basename "$t"
+}
+
+kept_releases() {
+    # Newest first. Only clean modules-<version> names are rollback
+    # candidates; *.replaced-* leftovers from a --force re-deploy are listed
+    # by --list-backups but never auto-selected.
+    (cd "$CLAUDE_NODE_DIR" && ls -1dt modules-*/ 2>/dev/null) \
+        | sed 's|/$||' | grep -E '^modules-[0-9][0-9.]*$' || true
+}
+
 list_backups() {
-    local backups
-    mapfile -t backups < <(ls -1t "$CLAUDE_NODE_DIR"/bundle.js.v*.bak 2>/dev/null || true)
-    if [[ ${#backups[@]} -eq 0 ]]; then
-        echo "(no backups found in $CLAUDE_NODE_DIR)"
+    local live d ts v mark
+    live="$(live_release)"
+    mapfile -t dirs < <( (cd "$CLAUDE_NODE_DIR" && ls -1dt modules-*/ 2>/dev/null) | sed 's|/$||' || true)
+    if [[ ${#dirs[@]} -eq 0 ]]; then
+        echo "(no kept releases in $CLAUDE_NODE_DIR)"
         return 1
     fi
-    for b in "${backups[@]}"; do
-        local v ts
-        v="$(basename "$b" | sed -E 's/^bundle\.js\.v(.+)\.bak$/\1/')"
-        ts="$(stat -c %y "$b" | cut -d'.' -f1)"
-        printf '  %s  →  v%s\n' "$ts" "$v"
+    for d in "${dirs[@]}"; do
+        v="${d#modules-}"
+        ts="$(stat -c %y "$CLAUDE_NODE_DIR/$d" | cut -d'.' -f1)"
+        mark=" "; [[ "$d" == "$live" ]] && mark="*"
+        printf '  %s %s  v%s\n' "$mark" "$ts" "$v"
     done
+    echo "  (* = live, modules/ points here)"
 }
 
 rollback() {
     local target="${1:-}"
-    local backup
+    local dir live
+    live="$(live_release)"
     if [[ -n "$target" ]]; then
-        backup="$CLAUDE_NODE_DIR/bundle.js.v${target}.bak"
-        [[ -f "$backup" ]] || die "No backup for version $target"
+        dir="modules-${target}"
+        [[ -d "$CLAUDE_NODE_DIR/$dir" ]] || die "No kept release for version $target"
     else
-        backup="$(ls -1t "$CLAUDE_NODE_DIR"/bundle.js.v*.bak 2>/dev/null | head -1)"
-        [[ -n "$backup" ]] || die "No backups available in $CLAUDE_NODE_DIR"
+        dir="$(kept_releases | grep -vxF "$live" | head -1 || true)"
+        [[ -n "$dir" ]] || die "No kept release other than the live one in $CLAUDE_NODE_DIR"
     fi
-    local v
-    v="$(basename "$backup" | sed -E 's/^bundle\.js\.v(.+)\.bak$/\1/')"
-    log "Rolling back to v$v (from $backup)…"
-    cp "$backup" "$CLAUDE_NODE_DIR/bundle.js"
+    local v="${dir#modules-}"
+    log "Rolling back to v$v (modules/ -> $dir)…"
+    ln -sfn "$dir" "$CLAUDE_NODE_DIR/modules"
     local tmp
     tmp="$(mktemp)"
     jq --arg v "$v" '.version = $v' "$CLAUDE_NODE_DIR/package.json" > "$tmp"
@@ -165,7 +196,7 @@ rollback() {
             "$CLAUDE_NODE_DIR/package-lock.json" > "$tmp"
         mv "$tmp" "$CLAUDE_NODE_DIR/package-lock.json"
     fi
-    sed -i -E "s|Run Claude Code [0-9.]+'s JS bundle|Run Claude Code ${v}'s JS bundle|" \
+    sed -i -E "s|Run Claude Code [0-9.]+'s module graph|Run Claude Code ${v}'s module graph|" \
         "$CLAUDE_NODE_DIR/launcher.js"
     log "✅ Rolled back to v$v"
 }
@@ -211,74 +242,58 @@ objcopy --dump-section .bun=claude.bun package/claude 2>/dev/null \
     || die "objcopy failed (is it a Bun SFE?)"
 [[ -s claude.bun ]] || die "claude.bun is empty"
 
-log "Extracting JS bundle (anchored to cli.js header)…"
-# Pre-2.1.133 the cli.js bundle sat at fixed offset 0x1b0 in the .bun section.
-# v2.1.133 prepended precompiled bytecode and packed extra worker bundles
-# (image-processor.js, audio-capture.js) into the same section, so the offset
-# floats; we anchor on the cli.js entrypoint path. v2.1.232 then inserted a
-# second NUL-separated path entry (the `/$bunfs/root/cli` short-name alias)
-# BETWEEN the cli.js path and its `// @bun` header, so the old adjacency anchor
-# (`cli.js\0// @bun`) stopped matching. Robust fix: find the cli.js entrypoint
-# path whose `// @bun` header sits within a short window (skipping any
-# NUL-separated sibling alias paths). Requiring the header nearby rules out both
-# the early `file://…/cli.js` string in the header table (its `// @bun` is
-# ~200 MB downstream) and a worker bundle that might reorder ahead of cli.js
-# (its header belongs to a different path entirely).
-python3 - <<'PY'
-data = open('claude.bun', 'rb').read()
-anchor = b'/$bunfs/root/src/entrypoints/cli.js'
-start = None
-p = 0
-while True:
-    p = data.find(anchor, p)
-    if p == -1:
-        break
-    m = data.find(b'// @bun', p)
-    if m != -1 and 0 <= m - p < 128:
-        start = m
-        break
-    p += 1
-if start is None:
-    raise SystemExit("cli.js '// @bun' header not found in .bun section "
-                     "(expected '/$bunfs/root/src/entrypoints/cli.js' followed by "
-                     "'// @bun' within 128 bytes; .bun layout changed again?)")
-# Entries in the .bun section are NUL-separated: the cli.js payload is followed
-# by \x00 and then the next path. Cut on that terminator. NUL-termination is
-# safe because minified JS escapes any literal NUL (\x00 / \0 / \uXXXX) in its
-# source text, so a raw 0x00 byte never appears inside the bundle. A truncation
-# whose last 8 bytes happen to contain "})" would slip past the trailer check
-# below (~1.6% of cut points), so this relies on that no-raw-NUL invariant.
-end = data.find(b'\x00', start)
-if end == -1:
-    raise SystemExit("no NUL terminator after the cli.js bundle "
-                     "(.bun section truncated?)")
-open('bundle.js', 'wb').write(data[start:end])
-print(f"extracted {end - start} bytes (start at 0x{start:x})")
-PY
-[[ -s bundle.js ]] || die "bundle.js is empty"
+log "Extracting the module graph…"
+# Up to 2.1.241 the section held ONE CJS bundle (cli.js) that the extractor
+# located by anchoring on its path marker; the layout drifted twice (2.1.133
+# bytecode prefix, 2.1.232 alias entry) and each time only the anchor moved.
+# 2.1.242/243 replaced that bundle with a Bun standalone module graph: ~1400
+# ESM modules, each tagged `// @bun @bytecode` but shipped as SOURCE, addressed
+# through a table before the trailer. extract-modulegraph.py parses that
+# table (format notes in its docstring) and unpacks every module; the audits
+# below run over the concatenated JS sources exactly as they ran over the
+# single bundle.
+AUDIT_SRC="$WORK/audit-concat.js"
+python3 "$CLAUDE_NODE_DIR/extract-modulegraph.py" claude.bun \
+    --out "$WORK/modules" --audit-concat "$AUDIT_SRC" --version "$VERSION" \
+    || die "module graph extraction failed (.bun layout changed again?)"
 
-log "Header/trailer sanity check…"
-HEAD="$(head -c 80 bundle.js)"
-TAIL="$(tail -c 8 bundle.js)"
-if ! [[ "$HEAD" == *"@bun"* ]] \
-   || ! [[ "$HEAD" =~ function\(exports,[[:space:]]*require,[[:space:]]*module ]]; then
-    die "Bundle header mismatch — extraction offset may have changed.
-     Got: $HEAD"
-fi
-if ! [[ "$TAIL" == *"})"* ]]; then
-    die "Bundle trailer not '})' — extraction incomplete. Got: '$TAIL'"
-fi
-log "  ✓ header + trailer match"
+log "Module graph sanity check…"
+# The manifest, its entry and the size of the graph. Thresholds sit far below
+# 2.1.245 (1387 modules, ~36 MB of JS) and far above anything a mis-parsed
+# table could produce by accident, so they catch a truncated dump or a table
+# read from the wrong offset without tracking release growth.
+MG_MODULES=$(jq '.modules | length' "$WORK/modules/_index.json")
+MG_JS_BYTES=$(jq '[.modules[] | select(.js) | .bytes] | add' "$WORK/modules/_index.json")
+MG_ENTRY=$(jq -r '.entry' "$WORK/modules/_index.json")
+MG_ENTRY_FILE="$WORK/modules/$(jq -r '.modules[.entry_index].file' "$WORK/modules/_index.json")"
+[[ "$MG_MODULES" -ge 500 ]] || die "module graph has only $MG_MODULES modules (expected hundreds)"
+[[ "$MG_JS_BYTES" -ge 20000000 ]] || die "module graph JS totals only $MG_JS_BYTES bytes (expected > 20 MB)"
+[[ "$MG_ENTRY" == '/$bunfs/root/'* ]] || die "unexpected entry point: $MG_ENTRY"
+[[ -s "$MG_ENTRY_FILE" ]] || die "entry module file missing: $MG_ENTRY_FILE"
+head -c 80 "$MG_ENTRY_FILE" | grep -q '// @bun' || die "entry module lacks the // @bun header"
+[[ -s "$AUDIT_SRC" ]] || die "audit concatenation is empty"
+log "  ✓ $MG_MODULES modules, $MG_JS_BYTES bytes of JS, entry $MG_ENTRY"
 
-log "External require() audit (vs package.json)…"
+log "External import audit (vs package.json)…"
+# Two spellings of an external dependency in the graph: CJS `require("x")`
+# (ajv, react) and, new with the ESM graph, the minified import forms
+# `from"x"`, `import"x"` and `import("x")` (ws, node-fetch). Only the
+# no-whitespace minified forms are matched, and the specifier is restricted
+# to package-name characters: with a space allowed, the audit would pick up
+# the code samples the bundle carries as prompt text (`import Anthropic from
+# '@anthropic-ai/sdk'`), and with an unrestricted `[^"]+` it matched the
+# string literal `"from"` in the bundled acorn parser plus whatever followed.
 mapfile -t REQS < <(
-    grep -oE 'require\("[^"]+"\)' bundle.js \
-        | sed -E 's/^require\("([^"]+)"\)$/\1/' \
-        | grep -vE '^(node:|\./|/)' \
+    { grep -oE 'require\("[^"]+"\)' "$AUDIT_SRC" | sed -E 's/^require\("([^"]+)"\)$/\1/';
+      grep -oE '(from|import)"(@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*"' "$AUDIT_SRC" \
+          | sed -E 's/^(from|import)"([^"]+)"$/\2/';
+      grep -oE 'import\("(@[A-Za-z0-9_.-]+/)?[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*"\)' "$AUDIT_SRC" \
+          | sed -E 's/^import\("([^"]+)"\)$/\1/'; } \
+        | grep -vE '^(node:|\./|\.\./|/)' \
         | grep -vE '^(fs|path|os|util|crypto|http|https|url|child_process|stream|events|buffer|assert|zlib|net|tls|dns|readline|worker_threads|module|v8|perf_hooks|tty|string_decoder|timers|async_hooks|querystring|process|cluster|repl|inspector|vm|constants|dgram|punycode|trace_events|http2|domain|console)(/.*)?$' \
         | sort -u
 )
-log "  Bundle requires: ${REQS[*]}"
+log "  Bundle imports: ${REQS[*]}"
 
 DECLARED=$(jq -r '.dependencies | keys[]' "$CLAUDE_NODE_DIR/package.json" | sort -u)
 log "  Declared deps: $(echo $DECLARED | tr '\n' ' ')"
@@ -358,9 +373,9 @@ declare -A AUDIT_INERT_BUN=(
     [Bun.stdin]='new Response(Bun.stdin.stream()).text()'
 )
 mapfile -t BUN_HITS < <(
-python3 - <<'PY'
-import re
-src = open('bundle.js').read()
+python3 - "$AUDIT_SRC" <<'PY'
+import re, sys
+src = open(sys.argv[1]).read()
 guard_re = re.compile(r'typeof\s+(?:globalThis\.)?Bun')
 sym_re = re.compile(r'Bun\.[A-Za-z_]+')
 flagged = set()
@@ -386,8 +401,8 @@ for h in "${BUN_HITS[@]}"; do
     if [[ -n "${AUDIT_INERT_BUN[$h]+set}" ]]; then
         fp="${AUDIT_INERT_BUN[$h]}"
         set +e
-        sym_n=$(grep -oF -- "$h" bundle.js | wc -l)
-        fp_n=$(grep -oF -- "$fp" bundle.js | wc -l)
+        sym_n=$(grep -oF -- "$h" "$AUDIT_SRC" | wc -l)
+        fp_n=$(grep -oF -- "$fp" "$AUDIT_SRC" | wc -l)
         set -e
         if [[ "$fp_n" -gt 0 && "$sym_n" -eq "$fp_n" ]]; then
             INERT_BUN+=("$h")
@@ -428,9 +443,9 @@ log "Bun.ant member audit…"
 # the shim Proxy throws loudly on any unknown member read.
 ANT_MEMBERS=( getPeerUid getPeerPid setDumpable memoryPressureLevel )
 mapfile -t ANT_HITS < <(
-python3 - <<'PY'
-import re
-src = open('bundle.js').read()
+python3 - "$AUDIT_SRC" <<'PY'
+import re, sys
+src = open(sys.argv[1]).read()
 for s in sorted(set(m.group(1) for m in re.finditer(r'Bun\.ant\.([A-Za-z_$][A-Za-z0-9_$]*)', src))):
     print(s)
 PY
@@ -500,33 +515,43 @@ fi
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
     log "✅ Dry-run complete — all audits passed for v${VERSION}. No changes made."
-    log "   Extracted bundle: $WORK/bundle.js ($(stat -c %s "$WORK/bundle.js") bytes)"
+    log "   Extracted module graph: $WORK/modules ($MG_MODULES modules, $MG_JS_BYTES bytes of JS)"
     exit 0
 fi
 
-# NOTE: on a fresh clone / first-time deploy, package.json can already record
-# a version (e.g. committed by whoever last maintained the tree) while
-# bundle.js has never actually been written to disk on THIS machine. In that
-# case CURRENT == VERSION is possible too (handled above by --force), but even
-# on a genuine version bump there may simply be no prior bundle.js yet. Guard
-# the backup so first-time deploys don't abort on a missing source file.
-if [[ -f "$CLAUDE_NODE_DIR/bundle.js" ]]; then
-    log "Backing up current bundle…"
-    cp "$CLAUDE_NODE_DIR/bundle.js" "$CLAUDE_NODE_DIR/bundle.js.v${CURRENT}.bak"
-    log "  → bundle.js.v${CURRENT}.bak"
-else
-    log "No existing bundle to back up (first-time deploy)."
+# Deploy = copy the release into modules-<VERSION>/ and re-point the modules/
+# symlink. The previous release stays where it is; that IS the backup, and
+# rollback re-points the link. Never delete the live target: sessions import
+# chunks lazily from the directory they resolved at startup.
+NEW_DIR="$CLAUDE_NODE_DIR/modules-${VERSION}"
+if [[ -e "$NEW_DIR" ]]; then
+    # --force re-deploy of a version we still keep (possibly the live one):
+    # move it aside instead of deleting it out from under a running session.
+    aside="${NEW_DIR}.replaced-$(date +%Y%m%d%H%M%S)"
+    log "modules-${VERSION} already exists, moving it aside to $(basename "$aside")"
+    mv "$NEW_DIR" "$aside"
+fi
+if [[ -d "$CLAUDE_NODE_DIR/modules" && ! -L "$CLAUDE_NODE_DIR/modules" ]]; then
+    # A real directory here predates the symlink scheme; keep it as a release.
+    log "modules/ is a plain directory, keeping it as modules-${CURRENT}"
+    mv "$CLAUDE_NODE_DIR/modules" "$CLAUDE_NODE_DIR/modules-${CURRENT}"
+fi
+if [[ -f "$CLAUDE_NODE_DIR/bundle.js" && ! -e "$CLAUDE_NODE_DIR/modules" ]]; then
+    log "Single-bundle tree (bundle.js) detected: first module-graph deploy."
+    log "  bundle.js and its .bak copies are left untouched; the pre-modulegraph"
+    log "  launcher in git history still runs them if you need to go back."
 fi
 
-# Rotate bundle backups to the newest 5, mirroring the log rotation above.
-# Unbounded, this had grown to 59 files / 916 MB by 2026-07-19, gaining
-# ~20 MB per nightly release; five backups cover every realistic rollback
-# (the nightly auto-rollback needs exactly one). Same pipefail trap as the
-# log rotation: an empty glob makes `ls` exit 2, so subshell + || true.
-(ls -1t "$CLAUDE_NODE_DIR"/bundle.js.v*.bak 2>/dev/null | tail -n +6 | xargs -r rm -f) || true
+log "Deploying new release to modules-${VERSION}/…"
+cp -a "$WORK/modules" "$NEW_DIR"
+ln -sfn "modules-${VERSION}" "$CLAUDE_NODE_DIR/modules"
 
-log "Deploying new bundle…"
-cp bundle.js "$CLAUDE_NODE_DIR/bundle.js"
+# Keep the newest 5 releases besides the live one, mirroring the old bundle
+# backup rotation (five covered every realistic rollback; the nightly
+# auto-rollback needs exactly one). Same pipefail trap as the log rotation:
+# an empty glob makes `ls` exit 2, so subshell + || true.
+(cd "$CLAUDE_NODE_DIR" && ls -1dt modules-*/ 2>/dev/null | sed 's|/$||' \
+    | grep -vxF "modules-${VERSION}" | tail -n +6 | xargs -r rm -rf) || true
 
 log "Bumping package.json version…"
 tmp="$(mktemp)"
@@ -547,20 +572,24 @@ if [[ -f "$CLAUDE_NODE_DIR/package-lock.json" ]]; then
 fi
 
 log "Updating launcher.js version comment…"
-sed -i -E "s|Run Claude Code [0-9.]+'s JS bundle|Run Claude Code ${VERSION}'s JS bundle|" \
+sed -i -E "s|Run Claude Code [0-9.]+'s module graph|Run Claude Code ${VERSION}'s module graph|" \
     "$CLAUDE_NODE_DIR/launcher.js"
 
 log "Running smoke test (claude-node --version)…"
 if ! smoke_test; then
     warn "❌ Smoke test failed — auto-rolling back to v${CURRENT}"
-    rollback "$CURRENT"
-    die "Update aborted. Bundle reverted. Inspect $CLAUDE_NODE_DIR/bundle.js.v${CURRENT}.bak vs. new candidate manually."
+    if [[ -d "$CLAUDE_NODE_DIR/modules-${CURRENT}" ]]; then rollback "$CURRENT"; else rollback; fi
+    die "Update aborted. modules/ re-pointed at the previous release; the failed one is kept at modules-${VERSION}/ for inspection."
 fi
 log "  ✓ smoke test passed"
 
-log "Bumping global npm package too (for version-reporting parity)…"
-if ! npm i -g "@anthropic-ai/claude-code@${VERSION}" >/dev/null 2>&1; then
-    warn "Global npm install failed — not fatal, claude-node will still work."
+if [[ "$GLOBAL_NPM" -eq 1 ]]; then
+    log "Bumping global npm package too (for version-reporting parity)…"
+    if ! npm i -g "@anthropic-ai/claude-code@${VERSION}" >/dev/null 2>&1; then
+        warn "Global npm install failed, not fatal: claude-node will still work."
+    fi
+else
+    log "Skipping the global npm bump (--no-global-npm)."
 fi
 
 # --- plugin support -----------------------------------------------------------

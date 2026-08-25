@@ -1,7 +1,10 @@
 #!/usr/bin/env node
-// Run Claude Code 2.1.232's JS bundle under Node (no Bun needed).
-// The bundle is a CJS IIFE expression: (function(exports,require,module,__filename,__dirname){...})
-// Node doesn't auto-invoke it, so we read + eval + call with module context.
+// Run Claude Code 2.1.245's module graph under Node (no Bun needed).
+// Since v2.1.242/243 a release is a Bun standalone module graph (~1400 ESM
+// modules addressed as /$bunfs/root/<name>), which extract-modulegraph.py
+// unpacks into modules/ and modulegraph-loader.js serves to Node's ESM loader
+// through module.registerHooks(). Everything up to the __bunShim object below
+// is the Bun API shim layer; plugin-shim.js evals exactly that prefix.
 
 const fs = require('fs');
 const path = require('path');
@@ -42,8 +45,19 @@ if (!Number.isFinite(nodeMajor) || nodeMajor < 24) {
   process.exit(1);
 }
 
-const bundlePath = path.join(__dirname, 'bundle.js');
-let src = fs.readFileSync(bundlePath, 'utf8');
+// The release lives in modules/ (extract-modulegraph.py output), a symlink to
+// modules-<version>/ so update.sh can switch releases atomically. Resolve the
+// link once, up front: chunks are imported lazily, so a session must keep
+// reading the release it started with even after the nightly re-pointed the
+// link. On a fresh clone there is no modules/ yet; the loader below reports
+// that with the path, and plugin-shim.js (which evals only the prefix up to
+// __bunShim) never needs it.
+let modulesDir = path.join(__dirname, 'modules');
+try { modulesDir = fs.realpathSync(modulesDir); } catch (_) { /* reported by the loader */ }
+// createRequire() wants a file path to resolve from; lookups walk up from
+// modules/ into this directory's node_modules, where the bundle's externals
+// (react, zod, ws, @anthropic-ai/sdk, ...) and the shim backers live.
+const bundlePath = path.join(modulesDir, '_index.json');
 
 // --- Bun shim ---------------------------------------------------------------
 // v128 inlined a wave of `function w8(H){return Bun.X(H,...)}` minifier-extracted
@@ -904,7 +918,7 @@ globalThis.__bunShim = {
 //   - identifiers ending in "Bun" (none in the bundle today, but cheap
 //     insurance against future minifier collisions), and
 //   - an immediately preceding quote, i.e. a symbol at the start of a string
-//     literal. This is a text substitution over 20 MB of minified source, so
+//     literal. This is a text substitution over ~36 MB of minified source, so
 //     without that guard it also rewrites Bun.* mentions inside strings the
 //     bundle shows to the user. 2.1.215 has exactly one, and it is precisely
 //     the message describing our own situation:
@@ -913,46 +927,38 @@ globalThis.__bunShim = {
 //     Same hazard AUDIT_INERT_BUN guards against in update.sh for non-shimmed
 //     symbols; note that update.sh's audit cannot catch it for SHIMMED_BUN
 //     ones, because membership short-circuits before any context inspection.
-src = src.replace(
-  /(?<!["'`])(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve|connect|ant)\b/g,
-  '__bunShim.$1',
-);
+// The loader applies this per module at load time (modulegraph-loader.js);
+// test/lockstep.test.js reads the alternation from this literal.
+const BUN_SHIM_RE = /(?<!["'`])(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve|connect|ant)\b/g;
 
-// Shape check before eval. A damaged bundle fails deep inside 20 MB of
-// minified source with a message that names a minified identifier and nothing
-// else: the bundle carries ~35 `using` declarations, which are legal inside
-// the wrapper function but a SyntaxError at Script top level. So a truncated
-// or unwrapped bundle surfaces as "SyntaxError: Unexpected identifier 'K'"
-// with a stack pointing at this line and no hint about the real cause
-// (issue #1). Same head/trailer criteria update.sh applies after extraction,
-// repeated here because bundle.js can also arrive by other means.
-const head = src.slice(0, 200);
-if (!head.includes('@bun') ||
-    !/function\(exports,\s*require,\s*module/.test(head) ||
-    !src.trimEnd().slice(-8).includes('})')) {
-  throw new Error(
-    `bundle.js is not an intact CJS bundle (${bundlePath}, ${src.length} bytes).\n` +
-    `  expected head: "// @bun …" followed by "(function(exports, require, module, …) {"\n` +
-    `  expected tail: "})"\n` +
-    `  actual head:   ${JSON.stringify(src.slice(0, 90))}\n` +
-    `  actual tail:   ${JSON.stringify(src.trimEnd().slice(-40))}\n` +
+// --- module graph loader -----------------------------------------------------
+// Shape check before anything runs: a damaged or absent manifest fails here
+// with the directory named, instead of deep inside a chunk with a message
+// that names a minified identifier and nothing else (the single-bundle era's
+// issue #1, same failure direction).
+const { createModuleGraphLoader } = require('./modulegraph-loader.js');
+let graph;
+try {
+  graph = createModuleGraphLoader({ modulesDir, bunShimRegex: BUN_SHIM_RE, bundleRequire });
+} catch (err) {
+  console.error(
+    `modules/ is not an intact Claude Code module graph (${modulesDir}).\n` +
+    `  ${err.message}\n` +
     'Re-extract it with claude-node-update.',
   );
+  process.exit(1);
 }
+// The bundle's import.meta.require (Bun-only) is rewritten to this global; it
+// is how the three N-API addons get loaded.
+globalThis.__bunfsRequire = graph.bunfsRequire;
+Module.registerHooks(graph.hooks);
 
-// Eval the top-level IIFE expression to get the wrapper function.
-const wrapper = (0, eval)(src);
-
-// Build a Module-like scope so the bundle's internal require() can resolve
-// both Node built-ins and the external deps we installed in this dir.
-const bundleModule = new Module(bundlePath, module);
-bundleModule.filename = bundlePath;
-bundleModule.paths = Module._nodeModulePaths(__dirname);
-
-wrapper(
-  bundleModule.exports,
-  bundleRequire,
-  bundleModule,
-  bundlePath,
-  __dirname,
-);
+// The entry is the /$bunfs/root/cli alias of src/entrypoints/cli.js, an ES
+// module: a dynamic import from this CJS loader is the supported way in. A
+// rejection here is a startup failure (a chunk that failed to link or throw
+// at module init), not a user error: print it and exit non-zero, as the old
+// eval path did on a throw.
+import(graph.entryUrl).catch((err) => {
+  console.error((err && err.stack) || err);
+  process.exit(1);
+});

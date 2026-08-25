@@ -4,11 +4,11 @@ Run [Anthropic's Claude Code CLI](https://www.npmjs.com/package/@anthropic-ai/cl
 
 ## What it does
 
-Anthropic ships `claude` as a Bun single-file executable. The actual logic is a JavaScript bundle embedded in a `.bun` ELF section. This repo:
+Anthropic ships `claude` as a Bun single-file executable. The actual logic is JavaScript embedded in a `.bun` ELF section: up to v2.1.241 one CommonJS bundle, since v2.1.242/243 a Bun standalone **module graph** of ~1400 ES modules (each tagged `// @bun @bytecode`, but shipped as source next to the bytecode). This repo:
 
-1. **Extracts** the JS bundle from the Bun SFE (`objcopy --dump-section`, then anchors on the in-section `cli.js` path marker)
-2. **Runs** it under Node via a thin loader (`launcher.js`)
-3. **Shims** the Bun-only APIs the bundle uses (YAML, TOML, semver, PTY, ANSI text metrics, hashing, file I/O, …) with Node equivalents, by source-replacing each `Bun.<symbol>` before `eval`
+1. **Extracts** every module from the Bun SFE (`objcopy --dump-section`, then `extract-modulegraph.py` parses the module table in front of the `---- Bun! ----` trailer) into `modules/`
+2. **Runs** the graph under Node: `launcher.js` registers `modulegraph-loader.js` through `module.registerHooks()`, which serves `/$bunfs/root/<name>` imports from the extracted files, and imports the entry
+3. **Shims** the Bun-only APIs the bundle uses (YAML, TOML, semver, PTY, ANSI text metrics, hashing, file I/O, …) with Node equivalents, by source-replacing each `Bun.<symbol>` in every module as it loads
 4. **Audits** new releases before deploying — refuses updates that introduce unguarded `Bun.*` call sites without a known shim, or new `require()` targets that aren't declared in `package.json`
 
 ## Requirements
@@ -38,12 +38,15 @@ Also needed: `objcopy` (binutils) and `npm` for the updater.
 
 ```
 ~/.claude-node/
-  bundle.js              # extracted JS bundle (gitignored, fetched per release)
-  bundle.js.v*.bak       # rollback backups (gitignored)
-  launcher.js            # Node loader + Bun shim
+  modules -> modules-<ver>/  # the live release (symlink, gitignored)
+  modules-<ver>/         # one kept release: one file per module + _index.json
+                         # manifest (gitignored, fetched per release; newest 5 kept)
+  launcher.js            # Node entry: Bun shim layer + module-graph loader registration
+  modulegraph-loader.js  # resolve/load hooks for /$bunfs/root/* (module.registerHooks)
+  extract-modulegraph.py # parses the .bun module table, unpacks the graph
   plugin-shim.js         # Bun API shim for plugin subprocesses (--require'd)
   update.sh              # updater (symlinked as claude-node-update in PATH)
-  package.json           # deps: Bun-shim backers + the bundle's own require() targets
+  package.json           # deps: Bun-shim backers + the bundle's own external imports
   package-lock.json      # pinned dependency tree
   bin/
     bun                  # bun PATH dispatcher for plugin subprocesses
@@ -121,15 +124,17 @@ npm install       # once: the suites exercise the shims' real npm backers
 npm test          # runs every test/*.test.js
 ```
 
-No test framework and no dev dependencies, and `bundle.js` is not needed (the suites resolve modules relative to it but never read it), so the tests run on a clone without a deployed release. They do need `node_modules`, because a shim is tested through the package that backs it rather than through a mock.
+No test framework and no dev dependencies, and no deployed release is needed (the suites that touch the module graph build their own synthetic ones), so the tests run on a clone. They do need `node_modules`, because a shim is tested through the package that backs it rather than through a mock.
 
-- **`test/lockstep.test.js`** enforces the invariants that are silent when they break. Every shimmed symbol must appear in all four places it has to: the source-replace regex, the `__bunShim` object behind it, `SHIMMED_BUN` in `update.sh`, and the coverage tables above. The worst drift direction is a symbol in `SHIMMED_BUN` that nothing rewrites, because the audit then stays quiet while a bare `Bun.X` reaches the eval'd bundle and throws `ReferenceError` on first use; the README direction is the one that actually happened, sitting stale at 15 symbols for four releases. `SHIMMED_BUN` is read by handing the array to `bash` rather than by regex, so quoting and word-splitting agree with `update.sh` by construction. The same file also asserts that every `bundleRequire()` backer resolves (see below).
+- **`test/lockstep.test.js`** enforces the invariants that are silent when they break. Every shimmed symbol must appear in all four places it has to: the source-replace regex, the `__bunShim` object behind it, `SHIMMED_BUN` in `update.sh`, and the coverage tables above. The worst drift direction is a symbol in `SHIMMED_BUN` that nothing rewrites, because the audit then stays quiet while a bare `Bun.X` reaches a loaded chunk and throws `ReferenceError` on first use; the README direction is the one that actually happened, sitting stale at 15 symbols for four releases. `SHIMMED_BUN` is read by handing the array to `bash` rather than by regex, so quoting and word-splitting agree with `update.sh` by construction. The same file also asserts that every `bundleRequire()` backer resolves (see below).
 - **`test/bunfile-shim.test.js`** covers the `Bun.file` shim (55 cases): input forms, lazy construction, positioned `fd` reads, MIME mapping, `writer()`, `stream()`, and the deliberate `slice()` throw.
 - **`test/toml-shim.test.js`** covers the `Bun.TOML` shim (51 cases), including the documented limits of the date round-trip.
 - **`test/spawn-shim.test.js`** covers the non-PTY `Bun.spawn` shim (20 cases, POSIX-only): the exact shapes of the bundle's call sites (rg probe, bg-pty-host breadcrumb, spare pool), stream readers, fd ownership, signal/ENOENT degradation, and a guard that fails loudly if an `unref()`d child drains the event loop before the report runs.
 - **`test/plugin-shim.test.js`** verifies that loading `plugin-shim.js` via `node --require` correctly sets up `globalThis.Bun` with the shimmed API surface (28 probes: namespace presence, YAML round-trip, file construction, hash, inert values, throw-on-use symbols, and Bun.ant members).
+- **`test/extract-modulegraph.test.js`** pins the `.bun` module-table layout that `extract-modulegraph.py` was reverse-engineered against (40 cases): a synthetic section built in the test round-trips byte-exact through the extractor, the entry follows the trailer word rather than table position, and every format violation the real dump could develop overnight (header count, trailer, table stride, entry range, name root, non-JS entry, pointer bounds) exits 2 without writing a manifest.
+- **`test/modulegraph-loader.test.js`** covers the loader (35 cases): every resolve rule (virtual `file:///$bunfs/root/` URLs, `bun:*` refusal, builtins and bare externals from graph modules, relative imports refused), every load rewrite (`Bun.X` to `__bunShim.X` outside string literals, `import.meta.require`, asset and addon path literals), and an end-to-end child process that registers the hooks with `module.registerHooks()` and imports a synthetic entry, because only Node itself can prove it accepts source served for URLs that exist nowhere on disk.
 
-A lazily required shim backer is invisible to **both** deploy gates: the dep audit reads `require()` targets out of `bundle.js` only, so a launcher-side package never appears in it, and the smoke test exercises only the eager requires at the top of `launcher.js`. `smol-toml` and `node-pty` are both lazy, so `npm ci`, `npm prune`, a partial `node_modules` restore or a fresh machine could produce a tree that passes every audit and both smoke probes and then fails when a user runs `claude import` or opens a background terminal. `update.sh` therefore asserts backer resolvability before the smoke test, and `npm test` asserts it too.
+A lazily required shim backer is invisible to **both** deploy gates: the dep audit reads `require()` targets out of the extracted sources only, so a launcher-side package never appears in it, and the smoke test exercises only the eager requires at the top of `launcher.js`. `smol-toml` and `node-pty` are both lazy, so `npm ci`, `npm prune`, a partial `node_modules` restore or a fresh machine could produce a tree that passes every audit and both smoke probes and then fails when a user runs `claude import` or opens a background terminal. `update.sh` therefore asserts backer resolvability before the smoke test, and `npm test` asserts it too.
 
 Shim suites extract the implementation from `launcher.js` between its `// --- <name> shim` / `// --- end <name> shim` markers and `eval` it, so the code under test is the shipped code rather than a copy that can drift. Renaming or dropping a marker makes the suite fail loudly instead of silently testing nothing. Since real Bun can never run on the hardware this project targets, a shim's semantics can only be calibrated against Bun's documentation and pinned down by cases like these, so any deliberate deviation belongs in a test with the reasoning next to it.
 
@@ -138,7 +143,7 @@ Shim suites extract the implementation from `launcher.js` between its `// --- <n
 The `package.json` deps are mostly of two kinds:
 
 - **Shim backers** — Node packages the loader wires into `__bunShim`: `yaml`, `smol-toml`, `semver`, `node-pty`, `string-width`, `strip-ansi`, `wrap-ansi`, `which`. (`smol-toml` is `require()`d lazily on first `Bun.TOML.parse`, so it costs nothing at startup.)
-- **The bundle's own `require()` targets** — modules the bundle imports directly under Node: `ajv` (+ `ajv-formats`), `undici`, `ws`, and — **since v2.1.160** — `react` + `react-dom` (`react-dom/client`).
+- **The bundle's own external imports** — modules the bundle loads directly under Node: `ajv` (+ `ajv-formats`), `undici`, `ws`, and — **since v2.1.160** — `react` + `react-dom` (`react-dom/client`). Since the module-graph format these come in two spellings, CJS `require("x")` and the minified ESM forms `from"x"` / `import("x")`; the updater's dep audit collects both.
 
 (`node-fetch` looks orphaned — the dep audit never lists it — because it's reached via a dynamic **`import("node-fetch")`**, not a static `require()`, inside the vendored `gaxios` HTTP client (Google-auth code paths). Under Node that lazy branch is the one taken (`window` is undefined), so it's a real conditional runtime dep and must stay. Pinned to v2 for CommonJS default-export compatibility. Caveat: the updater's require()-audit cannot see dynamic imports — a future bundle that adds a new `import()`-only dep would deploy without being flagged.)
 
@@ -150,14 +155,18 @@ React is pinned to **19** (`^19.2.0`). The bundle is built against React 19, not
 claude-node-update                  # fetch latest from npm, audit, deploy
 claude-node-update --dry-run        # run all audits, no deploy
 claude-node-update 2.1.160          # pin to a specific version
-claude-node-update --rollback       # restore most recent backup
-claude-node-update --list-backups   # show available backups
+claude-node-update --rollback       # re-point modules/ at the previous kept release
+claude-node-update --rollback 2.1.243   # ... or at a specific kept one
+claude-node-update --list-backups   # list kept releases (modules-*/), live one starred
 claude-node-update --force          # continue past audit warnings (use after manual review)
+claude-node-update --no-global-npm  # skip the global npm version bump (staging clones)
 ```
 
 When the dep audit reports a **new** `require()` target (as v2.1.160 did with React), add the package(s) to `package.json`, run `npm install`, then re-run the updater — `--force` is not needed once the dep is declared.
 
-After a successful deploy a smoke test runs both `claude-node --version` and `claude-node --help` (the `--help` path exercises the ANSI text-metric shims that a `--version`-only test would miss). On failure the previous bundle is auto-restored and the full probe output is kept in `logs/`.
+A deploy copies the release to `modules-<ver>/` and re-points the `modules` symlink; the previous release stays where it is (that is the backup, the newest five are kept) and rollback is a re-point. A running session is unaffected by either: `launcher.js` resolves the symlink once at startup and keeps lazily importing chunks from that directory. `CLAUDE_NODE_DIR` can be overridden to deploy into and smoke-test a staging clone.
+
+After a deploy a smoke test runs both `node launcher.js --version` and `--help` against the deployed tree (the `--help` path links the entry's static import closure and exercises the ANSI text-metric shims that a `--version`-only test would miss). On failure `modules/` is re-pointed at the previous release, the failed one is kept as `modules-<ver>/` for inspection, and the full probe output is in `logs/`.
 
 ## Why source-replace and not `globalThis.Bun = {...}`
 
@@ -182,12 +191,13 @@ The shape of the extracted bundle can change between Claude Code releases. Notab
 - **v2.1.220 (runtime finding, not a release audit)**: the background-worker subsystem (bg-pty-host, spare pool, bridge sessions) started exercising **non-PTY** `Bun.spawn` in normal operation, four days after the release deployed cleanly. The May-era throws-stub then crashed every worker spawn and eventually session startup ("worker crashed … respawning"). This is the release audit's documented blind spot: new call sites of an already-shimmed symbol are deliberately accepted, and only operation can surface them. The non-PTY branch is now a real `child_process`-backed implementation (see the coverage table); the stub policy (throw until a stub actually fires in normal use, then build the real shim) concluded as designed.
 - **v2.1.226**: `Bun.ant.getPeerPid` joined the namespace, the peer-pid sibling of `getPeerUid` at a new `[peer-cred]` call site. Same throws-stub treatment (SO_PEERCRED has no Node core equivalent, and the caller catches, warns and returns undefined), caught by the member-level `ANT_MEMBERS` audit rather than the symbol audit, which stops seeing new `Bun.ant` members once the namespace itself is shimmed.
 - **v2.1.232**: two changes in one release. (1) The `.bun` section layout shifted again: a second NUL-separated path entry (the `/$bunfs/root/cli` short-name alias) now sits between the `cli.js` entrypoint path and its `// @bun` header, so the old anchor (the `cli.js` path immediately followed by `// @bun`) stopped matching and the nightly aborted at extraction. The extractor now scans from the `cli.js` path to the first `// @bun` within a short window, skipping sibling alias paths. (2) `Bun.ant.memoryPressureLevel` joined the namespace (a macOS libdispatch memory-pressure query); throws-stub like its siblings, and doubly cold here since the caller only reaches it on macOS while Linux takes the `os.freemem()` branch.
+- **v2.1.242/243**: the single CJS bundle is gone. The `.bun` section now carries a Bun standalone module graph: 1387 table entries in 2.1.245, of which 1380 are ES modules tagged `// @bun @bytecode` but shipped as source (the bytecode is a separate blob the tag refers to), plus three N-API addons and four assets. The old extractor found only the 20 KB entry module and the header check (`function(exports, require, module`, which no longer appears anywhere) refused it, so the nightly failed safe on 2.1.241. The rework: `extract-modulegraph.py` parses the module table (offsets relative to the 8-byte section header, 52-byte entries, entry index in the trailer words) and unpacks every module; `modulegraph-loader.js` serves the graph to Node's ESM loader via `module.registerHooks()`, applying the `Bun.X` rewrite per module at load time. Two graph-only rewrites came with it: `import.meta.require` (how the bundle loads the addons) and the `/$bunfs/root/<asset>` string literals the bundle `readFile()`s (mermaid, highlight.js, the chart bundle, the preview HTML), which Bun serves from its virtual root and Node has to read from the extracted files. Module URLs keep the `file:///$bunfs/root/` form because the bundle calls `fileURLToPath(import.meta.url)`; a custom scheme dies there. `bun:jsc` and `bun:ffi` are refused at resolve time instead of stubbed: both call sites sit in try/catch and degrade. Releases live in `modules-<ver>/` behind a `modules` symlink, so the previous release is the backup and rollback is a re-point.
 
 ## Security notes
 
 - The updater runs `npm view`/`npm pack`/`npm install` against the public registry. It does not authenticate and does not transmit any local state.
-- Bundle source is verified via header (`@bun` + `function(exports, require, module`) and trailer (`})`). A mismatch aborts the update before anything is swapped.
+- The extracted graph is verified before anything is switched: manifest format, entry module present and `// @bun`-headed, module count and JS byte total above fixed floors. A mismatch aborts the update with the live release untouched.
 - The dep audit refuses new `require()` targets not declared in `package.json`; the `Bun.*` audit refuses new unguarded call sites without a shim. Continue past either only with `--force` after manual review.
-- Backups are kept in-place. There is no remote backup; rollbacks are local.
+- Previous releases are kept in place (`modules-<ver>/`). There is no remote backup; rollbacks are local.
 
 This is a personal-use tool. The Anthropic bundle itself is **not** redistributed here — it's fetched from npm at update time.

@@ -1,6 +1,6 @@
 {
   "name": "claude-code-node",
-  "version": "2.1.232",
+  "version": "2.1.245",
   "type": "commonjs",
   "private": true,
   "engines": {

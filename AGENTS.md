@@ -13,9 +13,10 @@ infer from the code, plus the traps that have actually bitten.
    Installing `@anthropic-ai/claude-code-linux-x64` to "fix" something bricks
    the working setup. Shims are calibrated against Bun's published docs and
    pinned by the unit suites, nothing else.
-2. **`bundle.js` and its backups are extracted proprietary Anthropic code.**
-   Never commit them, never quote bundle source into tracked files, never
-   weaken `.gitignore`. The bundle is fetched from npm at update time only.
+2. **`modules-*/` (and the `modules` symlink) hold extracted proprietary
+   Anthropic code**, as `bundle.js` did before the module-graph rework. Never
+   commit them, never quote module source into tracked files, never weaken
+   `.gitignore`. The release is fetched from npm at update time only.
 3. **No `npm ci`.** It rebuilds `node-pty`'s prebuilt native binary. Use
    `npm install` for new deps and `npm update <pkg>` for in-range bumps; plain
    `npm install` will NOT move a package the lockfile pins, even when a newer
@@ -41,7 +42,12 @@ infer from the code, plus the traps that have actually bitten.
    setup, re-apply them, or behavior silently reverts (effort level,
    auto-updater suppression).
 8. **Some hosts wrap `grep` with ugrep**, which rejects `-oE`/`-oc`. When
-   probing bundles, use `python3` or `command grep`.
+   probing the module graph, use `python3` or `command grep`.
+9. **Never delete or rewrite a `modules-<ver>/` directory that `modules`
+   points at, or that a running session started from.** Chunks are imported
+   lazily; a session keeps reading the directory it resolved at startup.
+   `update.sh` moves an existing directory aside (`*.replaced-*`) rather than
+   overwriting it, and rotation skips the live target. Keep it that way.
 
 ## Editing rules
 

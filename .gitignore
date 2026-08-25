@@ -1,3 +1,9 @@
+# Extracted, proprietary Anthropic code: never commit. Fetched per release by
+# update.sh into a versioned directory; `modules` is the symlink to the live one.
+modules
+modules-*/
+# Pre-modulegraph layout (single CJS bundle + its rollback copies), kept
+# ignored so a tree upgraded in place does not suddenly show them as untracked.
 bundle.js
 bundle.js.v*.bak
 node_modules/
@@ -5,3 +11,4 @@ node_modules/
 .env
 .env.*
 logs/
+__pycache__/
