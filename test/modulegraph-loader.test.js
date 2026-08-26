@@ -29,7 +29,9 @@ function makeGraph(modules, entry) {
   for (const m of modules) {
     const file = toSafe(m.path.slice('/$bunfs/root/'.length));
     fs.writeFileSync(path.join(dir, file), m.body);
-    index.modules.push({ path: m.path, file, bytes: Buffer.byteLength(m.body), js: m.js !== false });
+    const entry = { path: m.path, file, bytes: Buffer.byteLength(m.body), js: m.js !== false };
+    if (m.loader !== undefined) entry.loader = m.loader;
+    index.modules.push(entry);
   }
   fs.writeFileSync(path.join(dir, '_index.json'), JSON.stringify(index));
   return dir;
@@ -105,13 +107,38 @@ check('missing module names the path', throwsWith(() => load('file:///$bunfs/roo
 check('importing a .node as ESM is an error', throwsWith(() => load('file:///$bunfs/root/nat.node'), /native addon/));
 check('non-graph URL goes to nextLoad', load('file:///elsewhere/x.js') === NEXTL);
 
-// --- 4. bunfsRequire -------------------------------------------------------------
+// --- 4. bunfsRequire: loader semantics (Bun parity) ---------------------------
+// Pre-2.1.246 manifests carry no loader field: .node derives napi, other
+// non-JS derive file. 2.1.246+ manifests say text/file/napi/js explicitly.
 calls.length = 0;
 g.bunfsRequire('/$bunfs/root/nat.node');
-check('bunfsRequire maps a graph path to the extracted file', calls[0] === path.join(dir, 'nat.node'));
+check('napi (derived): graph path routes into real require', calls[0] === path.join(dir, 'nat.node'));
 g.bunfsRequire('yaml');
-check('bunfsRequire passes bare names through', calls[1] === 'yaml');
-check('bunfsRequire rejects unknown graph paths', throwsWith(() => g.bunfsRequire('/$bunfs/root/nope.node'), /not in the module graph/));
+check('bare names pass through to bundleRequire', calls[1] === 'yaml');
+check('unknown graph paths are refused', throwsWith(() => g.bunfsRequire('/$bunfs/root/nope.node'), /not in the module graph/));
+check('file (derived): require returns the extracted path', g.bunfsRequire('/$bunfs/root/x.asset') === path.join(dir, 'x.asset'));
+check('js: require of a graph module is refused loudly', throwsWith(() => g.bunfsRequire('/$bunfs/root/chunk-a.js'), /refusing to require\(\) graph JS module/));
+
+const ldir = makeGraph([
+  { path: '/$bunfs/root/cli', body: 'export const x=1;', loader: 'js' },
+  { path: '/$bunfs/root/prompt.md', body: '# Autonomous loop check\nZeile 2', js: false, loader: 'text' },
+  { path: '/$bunfs/root/vendor.js', body: 'not a module', js: false, loader: 'file' },
+  { path: '/$bunfs/root/nat2.node', body: 'ELF', js: false, loader: 'napi' },
+  { path: '/$bunfs/root/odd.bin', body: 'x', js: false, loader: 99 },
+], '/$bunfs/root/cli');
+const calls2 = [];
+const fake2 = (spec) => { calls2.push(spec); return { spec }; };
+fake2.resolve = fakeRequire.resolve;
+const g2 = createModuleGraphLoader({ modulesDir: ldir, bunShimRegex: RE, bundleRequire: fake2 });
+check('text: require returns the file CONTENT', g2.bunfsRequire('/$bunfs/root/prompt.md') === '# Autonomous loop check\nZeile 2');
+check('text: a rewritten absolute path yields the same content', g2.bunfsRequire(path.join(ldir, 'prompt.md')) === '# Autonomous loop check\nZeile 2');
+check('file (explicit): require returns the path', g2.bunfsRequire('/$bunfs/root/vendor.js') === path.join(ldir, 'vendor.js'));
+check('napi (explicit): routes into real require', (() => { calls2.length = 0; g2.bunfsRequire('/$bunfs/root/nat2.node'); return calls2[0] === path.join(ldir, 'nat2.node'); })());
+check('unknown loader id is refused loudly', throwsWith(() => g2.bunfsRequire('/$bunfs/root/odd.bin'), /unknown loader 99/));
+check('text/file entries are literal-rewritten in module source', (() => {
+  const src = g2.rewrite('const a="/$bunfs/root/prompt.md";const b="/$bunfs/root/vendor.js";');
+  return src.includes(path.join(ldir, 'prompt.md')) && src.includes(path.join(ldir, 'vendor.js'));
+})());
 
 // --- 5. end to end through module.registerHooks --------------------------------
 const e2e = makeGraph([

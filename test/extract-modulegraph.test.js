@@ -31,13 +31,15 @@ function buildSection(modules, { entryIndex = 0, mutate } = {}) {
   const entries = modules.map((m) => {
     const name = Buffer.from(m.name, 'utf8');
     const body = Buffer.isBuffer(m.body) ? m.body : Buffer.from(m.body, 'utf8');
-    return { nOff: put(name), nLen: name.length, cOff: put(body), cLen: body.length };
+    return { nOff: put(name), nLen: name.length, cOff: put(body), cLen: body.length,
+             flags: m.flags !== undefined ? m.flags : 0x10101 };
   });
   const table = Buffer.alloc(entries.length * ENTRY_SIZE);
   entries.forEach((e, i) => {
     const b = i * ENTRY_SIZE;
     table.writeUInt32LE(e.nOff, b); table.writeUInt32LE(e.nLen, b + 4);
     table.writeUInt32LE(e.cOff, b + 8); table.writeUInt32LE(e.cLen, b + 12);
+    table.writeUInt32LE(e.flags, b + 48);       // word [12]: loader in byte 1
   });
   const tableOff = put(table);
   const words = Buffer.alloc(64);
@@ -68,9 +70,11 @@ const JS = (rest) => `// @bun @bytecode\n// header\n${rest}`;
 const GOOD = [
   { name: '/$bunfs/root/cli', body: JS('import "/$bunfs/root/chunk-a.js";') },
   { name: '/$bunfs/root/chunk-a.js', body: JS('export const a=1;') },
-  { name: '/$bunfs/root/x.asset', body: '<!doctype html>' },
+  { name: '/$bunfs/root/x.asset', body: '<!doctype html>', flags: 0x1000500 },
   { name: '/$bunfs/root/sub/dir.js', body: JS('export const d=2;') },
-  { name: '/$bunfs/root/nat.node', body: Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x00, 0x01]) },
+  { name: '/$bunfs/root/nat.node', body: Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x00, 0x01]), flags: 0x1000a00 },
+  { name: '/$bunfs/root/prompt.md', body: '# Autonomous loop check', flags: 0x1000d01 },
+  { name: '/$bunfs/root/odd.bin', body: 'x', flags: 0x1006300 },
 ];
 
 // --- 1. happy path -------------------------------------------------------------
@@ -92,6 +96,11 @@ const GOOD = [
   check('asset and addon flagged non-js', at('/$bunfs/root/x.asset').js === false && at('/$bunfs/root/nat.node').js === false);
   check('slash in a name flattens to __', at('/$bunfs/root/sub/dir.js').file === 'sub__dir.js');
   check('bytes recorded per module', at('/$bunfs/root/x.asset').bytes === Buffer.byteLength('<!doctype html>'));
+  check('loader byte decoded: js', at('/$bunfs/root/cli').loader === 'js' && at('/$bunfs/root/chunk-a.js').loader === 'js');
+  check('loader byte decoded: file', at('/$bunfs/root/x.asset').loader === 'file');
+  check('loader byte decoded: napi', at('/$bunfs/root/nat.node').loader === 'napi');
+  check('loader byte decoded: text', at('/$bunfs/root/prompt.md').loader === 'text');
+  check('unknown loader id recorded numerically', at('/$bunfs/root/odd.bin').loader === 0x63);
   for (const m of GOOD) {
     const f = at(m.name).file ? path.join(out, at(m.name).file) : null;
     const want = Buffer.isBuffer(m.body) ? m.body : Buffer.from(m.body);

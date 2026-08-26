@@ -58,22 +58,54 @@ function createModuleGraphLoader({ modulesDir, bunShimRegex, bundleRequire }) {
   if (!index.entry.startsWith(BUNFS)) throw new Error(`entry ${index.entry} is not under ${BUNFS}`);
 
   const files = new Map();   // '/$bunfs/root/X' -> absolute extracted path
-  const assets = [];         // [['/$bunfs/root/X', absolute path], ...] for non-JS entries
+  const assets = [];         // [['/$bunfs/root/X', absolute path], ...] for non-module entries
+  const byAbs = new Map();   // absolute extracted path -> loader name (rewritten literals land here)
+  // Manifests written before 2.1.246 carry no loader field; derive the same
+  // behavior they got: .node addons are napi, other non-JS entries are plain
+  // files, everything else is a module.
+  const loaderOf = (m) => m.loader !== undefined ? m.loader
+    : (m.path.endsWith('.node') ? 'napi' : (m.js ? 'js' : 'file'));
   for (const m of index.modules) {
     if (typeof m.path !== 'string' || typeof m.file !== 'string') {
       throw new Error(`${indexPath}: malformed module entry ${JSON.stringify(m)}`);
     }
     const abs = path.join(modulesDir, m.file);
     files.set(m.path, abs);
-    if (!m.js) assets.push([m.path, abs]);
+    const ld = loaderOf(m);
+    byAbs.set(abs, ld);
+    if (ld !== 'js') assets.push([m.path, abs]);
   }
   if (!files.has(index.entry)) throw new Error(`entry ${index.entry} is not in the manifest`);
 
+  // Bun's require applies the entry's loader; mimic each semantics (2.1.246
+  // is where this first bites: prompt .md files are require()d as TEXT, and
+  // routing them into Node's require dies in a SyntaxError at startup).
+  // Rewritten string literals arrive here as absolute extracted paths, direct
+  // graph references as /$bunfs/root/ names; both resolve to the same entry.
   const bunfsRequire = (spec) => {
-    if (typeof spec === 'string' && spec.startsWith(BUNFS)) {
-      const abs = files.get(spec);
-      if (!abs) throw new Error(`[modulegraph] ${spec} is not in the module graph`);
-      return bundleRequire(abs);
+    let abs = null;
+    if (typeof spec === 'string') {
+      if (spec.startsWith(BUNFS)) {
+        abs = files.get(spec);
+        if (!abs) throw new Error(`[modulegraph] ${spec} is not in the module graph`);
+      } else if (byAbs.has(spec)) {
+        abs = spec;
+      }
+    }
+    if (abs !== null) {
+      const ld = byAbs.get(abs);
+      switch (ld) {
+        case 'text': return fs.readFileSync(abs, 'utf8');
+        case 'file': return abs;
+        case 'napi': return bundleRequire(abs);
+        case 'js': case undefined:
+          // No call site requires a graph JS module today (they are imported);
+          // compiling extracted ESM through CJS require would half-work at
+          // best, so refuse loudly instead.
+          throw new Error(`[modulegraph] refusing to require() graph JS module ${spec}`);
+        default:
+          throw new Error(`[modulegraph] unknown loader ${JSON.stringify(ld)} for ${spec}`);
+      }
     }
     return bundleRequire(spec);
   };

@@ -25,8 +25,16 @@ four words are name.off, name.len, contents.off, contents.len; the remaining
 words carry sourcemap / bytecode pointers and flags the loader does not need.
 `contents` of a JS module is its SOURCE TEXT (a `// @bun @bytecode` comment
 header followed by minified ESM); the precompiled bytecode is a separate blob
-the `@bytecode` tag refers to. Assets (*.asset, *.node, vendored *.min.js) are
-table entries too, without the `// @bun` header.
+the `@bytecode` tag refers to. Assets (*.asset, *.node, vendored *.min.js,
+and since 2.1.246 the *.md/*.txt prompt texts) are table entries too, without
+the `// @bun` header.
+
+Word [12] of an entry carries the Bun loader in its second byte (empirical,
+2.1.246): 0x01 js module, 0x05 file (require returns the path), 0x0a napi
+(native addon), 0x0d text (require returns the CONTENT). The manifest records
+it per module so the loader can mimic each semantics; 2.1.246 is where this
+first mattered: prompt .md files are require()d as text, and treating them
+as anything else makes --help die in a SyntaxError.
 
 Exit status: 0 on success, 2 on any format violation (nothing is written on
 a violation detected before extraction starts; a violation mid-table leaves a
@@ -43,6 +51,9 @@ BASE = 8            # StringPointer offsets are relative to after the header
 ENTRY_SIZE = 52     # 13 x u32 per module table entry
 ROOT = "/$bunfs/root/"
 JS_HEADER = b"// @bun"
+# Empirical Bun loader ids (second byte of table word [12]); unknown ids are
+# recorded numerically so the loader can refuse them loudly instead of guessing.
+LOADER_NAMES = {0x01: "js", 0x05: "file", 0x0A: "napi", 0x0D: "text"}
 
 
 class FormatError(Exception):
@@ -74,6 +85,7 @@ def parse(data):
     for i in range(count):
         f = struct.unpack_from("<13I", data, tab_abs + i * ENTRY_SIZE)
         n_off, n_len, c_off, c_len = BASE + f[0], f[1], BASE + f[2], f[3]
+        loader_byte = (f[12] >> 8) & 0xFF
         if n_off + n_len > tr or c_off + c_len > tr:
             raise FormatError(f"entry {i}: string pointer out of bounds")
         try:
@@ -83,7 +95,7 @@ def parse(data):
         if not name.startswith(ROOT) or len(name) == len(ROOT):
             raise FormatError(f"entry {i}: unexpected module name {name!r}")
         body = data[c_off:c_off + c_len]
-        modules.append((i, name, body))
+        modules.append((i, name, body, loader_byte))
     return entry_id, modules
 
 
@@ -108,7 +120,7 @@ def main(argv):
     concat = open(args.audit_concat, "wb") if args.audit_concat else None
     js_count = js_bytes = 0
     entry_path = None
-    for i, name, body in modules:
+    for i, name, body, loader_byte in modules:
         rel = name[len(ROOT):]
         safe = rel.replace("/", "__")
         with open(os.path.join(args.out, safe), "wb") as fh:
@@ -125,7 +137,8 @@ def main(argv):
             if not is_js:
                 print(f"extract-modulegraph: entry point {name} is not a JS module", file=sys.stderr)
                 return 2
-        index.append({"path": name, "file": safe, "bytes": len(body), "js": is_js})
+        index.append({"path": name, "file": safe, "bytes": len(body), "js": is_js,
+                      "loader": LOADER_NAMES.get(loader_byte, loader_byte)})
     if concat:
         concat.close()
     manifest = {

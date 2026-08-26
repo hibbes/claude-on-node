@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Run Claude Code 2.1.245's module graph under Node (no Bun needed).
+// Run Claude Code 2.1.246's module graph under Node (no Bun needed).
 // Since v2.1.242/243 a release is a Bun standalone module graph (~1400 ESM
 // modules addressed as /$bunfs/root/<name>), which extract-modulegraph.py
 // unpacks into modules/ and modulegraph-loader.js serves to Node's ESM loader
