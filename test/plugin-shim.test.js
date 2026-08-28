@@ -162,7 +162,7 @@ check('Bun.JSONL is undefined', () => {
 
 // --- 7. throws-on-first-use symbols still throw -------------------------------
 
-const throwsSymbols = ['generateHeapSnapshot', 'Transpiler', 'listen', 'serve', 'connect'];
+const throwsSymbols = ['generateHeapSnapshot', 'Transpiler', 'listen', 'serve', 'connect', 'build'];
 for (const sym of throwsSymbols) {
   // These throw on use, not on access — check by calling
   check(`Bun.${sym} throws when called`, () => {
@@ -170,6 +170,20 @@ for (const sym of throwsSymbols) {
     return out === 'threw';
   });
 }
+
+// --- 7b. Bun.which option mapping (Bun {PATH} vs npm which {path}) ------------
+// v2.1.248 filters the search PATH and passes it as {PATH}. Unmapped, npm
+// which ignores the unknown key and silently resolves against process PATH.
+check('Bun.which honors a restricting PATH option', () => {
+  const out = probe(`const p = require('path').dirname(Bun.which('sh') || '/bin/sh');` +
+    `console.log(String(Bun.which('sh', { PATH: p })))`);
+  return out !== 'null' && out.includes('sh');
+});
+
+check('Bun.which returns null when PATH excludes the command', () => {
+  const out = probe(`console.log(String(Bun.which('sh', { PATH: '/nonexistent-dir-xyz' })))`);
+  return out === 'null';
+});
 
 // --- 8. Bun.ant members exist and throw on call -------------------------------
 

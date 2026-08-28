@@ -864,8 +864,18 @@ globalThis.__bunShim = {
   stripANSI: (s) => stripAnsiMod(String(s ?? '')),
   wrapAnsi: (s, cols, opts) => wrapAnsiMod(String(s ?? ''), Number(cols) || 80, opts),
   which: (cmd, opts) => {
-    try { return whichMod.sync(String(cmd), { nothrow: true, ...(opts || {}) }); }
-    catch (_) { return null; }
+    // Bun.which options are {PATH, cwd}; npm which understands {path, pathExt}.
+    // Passing PATH through unmapped is a silent landmine: which ignores the
+    // unknown key and resolves against process.env.PATH instead of the
+    // caller's filtered PATH (first real call site: v2.1.248's sandbox PATH
+    // filtering). cwd only matters for relative PATH entries; npm which has
+    // no equivalent, and the 2.1.248 sites pass absolute entries only.
+    try {
+      const o = { ...(opts || {}) };
+      if (typeof o.PATH === 'string') { o.path = o.PATH; delete o.PATH; }
+      delete o.cwd;
+      return whichMod.sync(String(cmd), { nothrow: true, ...o });
+    } catch (_) { return null; }
   },
   hash: _bunShim_hash,
   deepEquals: _bunShim_deepEquals,
@@ -908,6 +918,16 @@ globalThis.__bunShim = {
     throw new Error('Bun.connect not supported under Node');
   },
 
+  build: () => {
+    // Bun's bundler API (v2.1.247/248): bundles a plugin's hooks module
+    // (hooks.ts) at runtime, feature itself rollout-gated. The only call site
+    // catches and wraps into its own HooksError ("cannot bundle the hooks
+    // module of <plugin>"), so under Node the feature degrades with its
+    // designed error while the CLI keeps running. Not implementable here
+    // without shipping a bundler; same policy as Bun.serve/listen/connect.
+    throw new Error('Bun.build not supported under Node (plugin hooks modules need the native binary)');
+  },
+
   // Anthropic-private native namespace (v2.1.219): a Proxy whose known members
   // throw on call and whose unknown member reads throw loudly. See the
   // Bun.ant shim block above for why a plain object would be a silent landmine.
@@ -929,7 +949,7 @@ globalThis.__bunShim = {
 //     ones, because membership short-circuits before any context inspection.
 // The loader applies this per module at load time (modulegraph-loader.js);
 // test/lockstep.test.js reads the alternation from this literal.
-const BUN_SHIM_RE = /(?<!["'`])(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve|connect|ant)\b/g;
+const BUN_SHIM_RE = /(?<!["'`])(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve|connect|build|ant)\b/g;
 
 // --- module graph loader -----------------------------------------------------
 // Shape check before anything runs: a damaged or absent manifest fails here
