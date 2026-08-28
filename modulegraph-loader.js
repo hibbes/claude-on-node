@@ -60,6 +60,7 @@ function createModuleGraphLoader({ modulesDir, bunShimRegex, bundleRequire }) {
   const files = new Map();   // '/$bunfs/root/X' -> absolute extracted path
   const assets = [];         // [['/$bunfs/root/X', absolute path], ...] for non-module entries
   const byAbs = new Map();   // absolute extracted path -> loader name (rewritten literals land here)
+  const virtOfAbs = new Map(); // absolute extracted path -> /$bunfs/root/ name (require(esm) needs the virtual form)
   // Manifests written before 2.1.246 carry no loader field; derive the same
   // behavior they got: .node addons are napi, other non-JS entries are plain
   // files, everything else is a module.
@@ -73,6 +74,7 @@ function createModuleGraphLoader({ modulesDir, bunShimRegex, bundleRequire }) {
     files.set(m.path, abs);
     const ld = loaderOf(m);
     byAbs.set(abs, ld);
+    virtOfAbs.set(abs, m.path);
     if (ld !== 'js') assets.push([m.path, abs]);
   }
   if (!files.has(index.entry)) throw new Error(`entry ${index.entry} is not in the manifest`);
@@ -98,11 +100,20 @@ function createModuleGraphLoader({ modulesDir, bunShimRegex, bundleRequire }) {
         case 'text': return fs.readFileSync(abs, 'utf8');
         case 'file': return abs;
         case 'napi': return bundleRequire(abs);
-        case 'js': case undefined:
-          // No call site requires a graph JS module today (they are imported);
-          // compiling extracted ESM through CJS require would half-work at
-          // best, so refuse loudly instead.
-          throw new Error(`[modulegraph] refusing to require() graph JS module ${spec}`);
+        case 'js': case undefined: {
+          // require() of a graph ES module (first real site: v2.1.250,
+          // import.meta.require("...chunk...").udsInboxShape). Bun's require
+          // returns the module namespace synchronously; Node's require(esm)
+          // does the same, and because module.registerHooks() intercepts CJS
+          // resolution too, requiring the VIRTUAL path routes through the
+          // same resolve/load hooks and the same module-map entry as import:
+          // measured instance-identical, single evaluation. The virtual form
+          // is essential: the extracted file also exists on disk, and a
+          // path-based require would parse the ESM source as CommonJS. A
+          // module with top-level await still throws (ERR_REQUIRE_ASYNC_
+          // MODULE), which is the same constraint Bun's require has.
+          return bundleRequire(virtOfAbs.get(abs));
+        }
         default:
           throw new Error(`[modulegraph] unknown loader ${JSON.stringify(ld)} for ${spec}`);
       }

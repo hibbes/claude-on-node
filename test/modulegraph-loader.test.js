@@ -117,7 +117,8 @@ g.bunfsRequire('yaml');
 check('bare names pass through to bundleRequire', calls[1] === 'yaml');
 check('unknown graph paths are refused', throwsWith(() => g.bunfsRequire('/$bunfs/root/nope.node'), /not in the module graph/));
 check('file (derived): require returns the extracted path', g.bunfsRequire('/$bunfs/root/x.asset') === path.join(dir, 'x.asset'));
-check('js: require of a graph module is refused loudly', throwsWith(() => g.bunfsRequire('/$bunfs/root/chunk-a.js'), /refusing to require\(\) graph JS module/));
+check('js: require routes bundleRequire at the VIRTUAL path (require(esm) via hooks)', (() => { calls.length = 0; g.bunfsRequire('/$bunfs/root/chunk-a.js'); return calls[0] === '/$bunfs/root/chunk-a.js'; })());
+check('js: a rewritten absolute path maps back to the virtual form', (() => { calls.length = 0; g.bunfsRequire(path.join(dir, 'chunk-a.js')); return calls[0] === '/$bunfs/root/chunk-a.js'; })());
 
 const ldir = makeGraph([
   { path: '/$bunfs/root/cli', body: 'export const x=1;', loader: 'js' },
@@ -146,8 +147,10 @@ const e2e = makeGraph([
     'import{a}from"/$bunfs/root/chunk-a.js";import{parse}from"yaml";import{fileURLToPath}from"url";' +
     'export const r=Bun.hash("x");export const p=fileURLToPath(import.meta.url);' +
     'export const y=parse("k: 1").k;export const a2=a;' +
+    'const ns=globalThis.__bunfsRequire("/$bunfs/root/chunk-a.js");' +
+    'export const req=ns.a;export const same=ns.a===a;export const evals=globalThis.__evalCount;' +
     'export const j=await import("bun:jsc").then(()=>"loaded",(e)=>e.code);' },
-  { path: '/$bunfs/root/chunk-a.js', body: 'export const a=1;' },
+  { path: '/$bunfs/root/chunk-a.js', body: 'globalThis.__evalCount=(globalThis.__evalCount||0)+1;export const a=1;' },
 ], '/$bunfs/root/cli');
 const child = spawnSync(process.execPath, ['-e', `
   const Module = require('module');
@@ -157,7 +160,8 @@ const child = spawnSync(process.execPath, ['-e', `
   globalThis.__bunShim = { hash: () => 42 };
   globalThis.__bunfsRequire = g.bunfsRequire;
   Module.registerHooks(g.hooks);
-  import(g.entryUrl).then((m) => console.log(JSON.stringify({ r: m.r, p: m.p, y: m.y, a2: m.a2, j: m.j })))
+  globalThis.__bunfsRequire = g.bunfsRequire;
+  import(g.entryUrl).then((m) => console.log(JSON.stringify({ r: m.r, p: m.p, y: m.y, a2: m.a2, j: m.j, req: m.req, same: m.same, evals: m.evals })))
     .catch((e) => { console.error(e); process.exit(1); });
 `], { encoding: 'utf8', timeout: 20000 });
 let got = null;
@@ -168,6 +172,8 @@ check('e2e: import.meta.url is the virtual file: path', got && got.p === '/$bunf
 check('e2e: bare import resolved from this repo\'s node_modules', got && got.y === 1);
 check('e2e: graph-internal import linked', got && got.a2 === 1);
 check('e2e: dynamic import of bun:jsc rejects with ERR_MODULE_NOT_FOUND', got && got.j === 'ERR_MODULE_NOT_FOUND');
+check('e2e: require(esm) of a graph module returns its exports', got && got.req === 1);
+check('e2e: require(esm) and import share ONE instance', got && got.same === true && got.evals === 1);
 if (child.status !== 0) console.error(child.stderr);
 
 // --- report -------------------------------------------------------------------
