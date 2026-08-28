@@ -112,7 +112,34 @@ function createModuleGraphLoader({ modulesDir, bunShimRegex, bundleRequire }) {
           // path-based require would parse the ESM source as CommonJS. A
           // module with top-level await still throws (ERR_REQUIRE_ASYNC_
           // MODULE), which is the same constraint Bun's require has.
-          return bundleRequire(virtOfAbs.get(abs));
+          // Hoisting these requires into static imports was tried and is
+          // WRONG: it reorders graph evaluation, and the bundle's esbuild
+          // lazy-init pattern depends on the require happening at its
+          // original position (measured: chunk-ttktdez6's top-level IIFE read
+          // an import that had not initialized yet). So the require stays
+          // in place; only the mid-cycle case needs help. Node refuses a
+          // require of a module currently evaluating in a cycle, where Bun
+          // hands out the not-yet-finished namespace whose bindings the
+          // call sites read LATER, inside functions (measured on all four
+          // 2.1.250 cycle sites: stored in a var, accessed after startup).
+          // A lazy proxy reproduces exactly that: the real require runs on
+          // first property access, by which time the cycle has completed.
+          // If code ever reads a binding while the cycle is STILL open, the
+          // deferred require throws the original error, loudly.
+          const virt = virtOfAbs.get(abs);
+          try {
+            return bundleRequire(virt);
+          } catch (err) {
+            if (err && err.code !== 'ERR_REQUIRE_CYCLE_MODULE') throw err;
+            let ns = null;
+            const resolve = () => (ns ??= bundleRequire(virt));
+            return new Proxy({}, {
+              get: (_, k) => (k === Symbol.toStringTag ? 'Module' : resolve()[k]),
+              has: (_, k) => k in resolve(),
+              ownKeys: () => Reflect.ownKeys(resolve()),
+              getOwnPropertyDescriptor: (_, k) => Reflect.getOwnPropertyDescriptor(resolve(), k),
+            });
+          }
         }
         default:
           throw new Error(`[modulegraph] unknown loader ${JSON.stringify(ld)} for ${spec}`);
@@ -123,36 +150,11 @@ function createModuleGraphLoader({ modulesDir, bunShimRegex, bundleRequire }) {
 
   const rewrite = (source) => {
     let s = source.replace(bunShimRegex, '__bunShim.$1');
-    // require() of a graph JS module became a real pattern in v2.1.249/250
-    // (356 sites, all direct literals) and at least one pair sits in a
-    // genuine import cycle (chunk-ns0ekkj0 <-> chunk-3w64c04v). Node's
-    // require(esm) refuses modules mid-cycle (ERR_REQUIRE_CYCLE_MODULE),
-    // while Bun hands out the partially initialized namespace. Rewriting the
-    // literal call into a hoisted `import * as` gives exactly Bun's
-    // semantics: same namespace object, and cycles resolve through ESM live
-    // bindings. Appended at the END of the source so no original offset
-    // shifts; import declarations hoist regardless of position. Non-JS
-    // targets and dynamic/aliased arguments (none today) keep the
-    // __bunfsRequire path, where the js case still serves require(esm) as a
-    // cycle-free fallback.
-    const hoisted = [];
-    const nsIdOf = new Map();
-    s = s.replace(/import\.meta\.require\("(\/\$bunfs\/root\/[^"]+)"\)/g, (full, virt) => {
-      const abs = files.get(virt);
-      if (!abs || byAbs.get(abs) !== 'js') return full; // text/napi/file/dynamic: unten regeln
-      let id = nsIdOf.get(virt);
-      if (id === undefined) {
-        id = `__bunfsNS${nsIdOf.size}`;
-        nsIdOf.set(virt, id);
-        hoisted.push(`;import * as ${id} from${JSON.stringify(virt)};`);
-      }
-      return id;
-    });
     s = s.replace(/import\.meta\.require\b/g, 'globalThis.__bunfsRequire');
     for (const [virt, abs] of assets) {
       if (s.includes(virt)) s = s.split(virt).join(abs);
     }
-    return s + hoisted.join('');
+    return s;
   };
 
   function resolve(specifier, context, nextResolve) {

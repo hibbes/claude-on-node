@@ -106,17 +106,27 @@ const load = (url) => g.hooks.load(url, {}, nextLoad);
 check('missing module names the path', throwsWith(() => load('file:///$bunfs/root/nope.js'), /nope\.js is not in the module graph/));
 {
   const r = g.rewrite('const A=import.meta.require("/$bunfs/root/chunk-a.js");' +
-    'const B=import.meta.require("/$bunfs/root/chunk-a.js");' +
     'const T=import.meta.require("/$bunfs/root/x.asset");');
-  check('js-target require literal becomes a hoisted namespace import',
-    r.includes('const A=__bunfsNS0;') && r.includes('import * as __bunfsNS0 from"/$bunfs/root/chunk-a.js";'));
-  check('repeated target reuses ONE hoisted import', r.includes('const B=__bunfsNS0;') && r.split('import * as __bunfsNS0').length === 2);
-  const r2 = g.rewrite('const A=import.meta.require("/$bunfs/root/chunk-a.js");' +
-    'const C=import.meta.require("/$bunfs/root/cli");');
-  check('distinct targets get distinct hoisted ids',
-    r2.includes('const A=__bunfsNS0;') && r2.includes('const C=__bunfsNS1;') &&
-    r2.includes('import * as __bunfsNS1 from"/$bunfs/root/cli";'));
-  check('non-js require stays on __bunfsRequire', r.includes('globalThis.__bunfsRequire('));
+  check('require literals all route through __bunfsRequire (no hoisting)',
+    r.includes('const A=globalThis.__bunfsRequire("/$bunfs/root/chunk-a.js");') && !r.includes('import * as'));
+}
+{
+  // Zyklusfall: erster require wirft ERR_REQUIRE_CYCLE_MODULE, der Proxy
+  // muss den echten require auf den ERSTEN Property-Zugriff verschieben.
+  let phase = 'cycling'; const seen = [];
+  const cyclingRequire = (spec) => {
+    seen.push(spec);
+    if (phase === 'cycling') { const e = new Error('cycle'); e.code = 'ERR_REQUIRE_CYCLE_MODULE'; throw e; }
+    return { late: 99 };
+  };
+  cyclingRequire.resolve = fakeRequire.resolve;
+  const gc = createModuleGraphLoader({ modulesDir: dir, bunShimRegex: RE, bundleRequire: cyclingRequire });
+  const ns = gc.bunfsRequire('/$bunfs/root/chunk-a.js');
+  check('mid-cycle require returns a deferring namespace, not a throw', typeof ns === 'object');
+  phase = 'done';
+  check('first property access performs the real require', ns.late === 99);
+  check('cycle proxy resolves the SAME virtual path', seen.every((x) => x === '/$bunfs/root/chunk-a.js'));
+  check('subsequent access is memoized', (() => { const n0 = seen.length; void ns.late; return seen.length === n0; })());
 }
 check('importing a .node as ESM is an error', throwsWith(() => load('file:///$bunfs/root/nat.node'), /native addon/));
 check('non-graph URL goes to nextLoad', load('file:///elsewhere/x.js') === NEXTL);
