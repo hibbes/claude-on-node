@@ -123,11 +123,36 @@ function createModuleGraphLoader({ modulesDir, bunShimRegex, bundleRequire }) {
 
   const rewrite = (source) => {
     let s = source.replace(bunShimRegex, '__bunShim.$1');
+    // require() of a graph JS module became a real pattern in v2.1.249/250
+    // (356 sites, all direct literals) and at least one pair sits in a
+    // genuine import cycle (chunk-ns0ekkj0 <-> chunk-3w64c04v). Node's
+    // require(esm) refuses modules mid-cycle (ERR_REQUIRE_CYCLE_MODULE),
+    // while Bun hands out the partially initialized namespace. Rewriting the
+    // literal call into a hoisted `import * as` gives exactly Bun's
+    // semantics: same namespace object, and cycles resolve through ESM live
+    // bindings. Appended at the END of the source so no original offset
+    // shifts; import declarations hoist regardless of position. Non-JS
+    // targets and dynamic/aliased arguments (none today) keep the
+    // __bunfsRequire path, where the js case still serves require(esm) as a
+    // cycle-free fallback.
+    const hoisted = [];
+    const nsIdOf = new Map();
+    s = s.replace(/import\.meta\.require\("(\/\$bunfs\/root\/[^"]+)"\)/g, (full, virt) => {
+      const abs = files.get(virt);
+      if (!abs || byAbs.get(abs) !== 'js') return full; // text/napi/file/dynamic: unten regeln
+      let id = nsIdOf.get(virt);
+      if (id === undefined) {
+        id = `__bunfsNS${nsIdOf.size}`;
+        nsIdOf.set(virt, id);
+        hoisted.push(`;import * as ${id} from${JSON.stringify(virt)};`);
+      }
+      return id;
+    });
     s = s.replace(/import\.meta\.require\b/g, 'globalThis.__bunfsRequire');
     for (const [virt, abs] of assets) {
       if (s.includes(virt)) s = s.split(virt).join(abs);
     }
-    return s;
+    return s + hoisted.join('');
   };
 
   function resolve(specifier, context, nextResolve) {
