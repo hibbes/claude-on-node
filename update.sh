@@ -218,7 +218,16 @@ if [[ -z "$VERSION" ]]; then
 fi
 log "Target version: $VERSION"
 
-CURRENT="$(jq -r .version "$CLAUDE_NODE_DIR/package.json" 2>/dev/null || echo 'unknown')"
+# The modules symlink is the live truth; package.json is only a fallback for
+# trees without a deployed release. Trusting package.json alone bit twice:
+# a staging clone's committed version bump rode in via git pull and made the
+# updater report "Already up-to-date" while an older release was live.
+if [[ -L "$CLAUDE_NODE_DIR/modules" ]]; then
+    CURRENT="$(basename "$(readlink "$CLAUDE_NODE_DIR/modules")")"
+    CURRENT="${CURRENT#modules-}"
+else
+    CURRENT="$(jq -r .version "$CLAUDE_NODE_DIR/package.json" 2>/dev/null || echo 'unknown')"
+fi
 log "Currently deployed: $CURRENT"
 
 if [[ "$CURRENT" == "$VERSION" && "$FORCE" -eq 0 ]]; then
