@@ -130,6 +130,15 @@ check('missing module names the path', throwsWith(() => load('file:///$bunfs/roo
   check('failure is not memoized: access after the cycle heals', ns !== null && (phase = 'done', ns.late === 99));
   check('resolution is memoized afterwards', ns !== null && (() => { const n0 = seen.length; void ns.late; return seen.length === n0; })());
 }
+{
+  // Nicht-Zyklus-Fehler duerfen NICHT in undefined verschluckt werden: ein
+  // kaputtes Modul muss beim Zugriff laut scheitern.
+  const brokenRequire = (spec) => { throw new Error('boom: broken module'); };
+  brokenRequire.resolve = fakeRequire.resolve;
+  const gb = createModuleGraphLoader({ modulesDir: dir, bunShimRegex: RE, bundleRequire: brokenRequire });
+  const nsb = gb.bunfsRequire('/$bunfs/root/chunk-a.js');
+  check('non-cycle errors surface on property access', throwsWith(() => nsb.x, /boom: broken module/));
+}
 check('importing a .node as ESM is an error', throwsWith(() => load('file:///$bunfs/root/nat.node'), /native addon/));
 check('non-graph URL goes to nextLoad', load('file:///elsewhere/x.js') === NEXTL);
 
