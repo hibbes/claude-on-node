@@ -47,7 +47,7 @@ const dir = makeGraph([
     'import{a}from"/$bunfs/root/chunk-a.js";const t="/$bunfs/root/x.asset";' +
     'const n=import.meta.require("/$bunfs/root/nat.node");const msg="Bun.hash unavailable";' +
     'export const r=Bun.hash("x");export const f=Bun.file("/dev/null");' },
-  { path: '/$bunfs/root/chunk-a.js', body: 'export const a=1;' },
+  { path: '/$bunfs/root/chunk-a.js', body: 'const a=1;export{a};' },
   { path: '/$bunfs/root/x.asset', body: '<!doctype html>', js: false },
   { path: '/$bunfs/root/nat.node', body: 'ELF', js: false },
 ], '/$bunfs/root/cli');
@@ -111,8 +111,8 @@ check('missing module names the path', throwsWith(() => load('file:///$bunfs/roo
     r.includes('const A=globalThis.__bunfsRequire("/$bunfs/root/chunk-a.js");') && !r.includes('import * as'));
 }
 {
-  // Zyklusfall: erster require wirft ERR_REQUIRE_CYCLE_MODULE, der Proxy
-  // muss den echten require auf den ERSTEN Property-Zugriff verschieben.
+  // Always-lazy: kein bundleRequire beim require selbst; Zyklus-Zugriff gibt
+  // undefined ohne Memoisierung; spaetere Zugriffe heilen; Identitaet stabil.
   let phase = 'cycling'; const seen = [];
   const cyclingRequire = (spec) => {
     seen.push(spec);
@@ -121,12 +121,14 @@ check('missing module names the path', throwsWith(() => load('file:///$bunfs/roo
   };
   cyclingRequire.resolve = fakeRequire.resolve;
   const gc = createModuleGraphLoader({ modulesDir: dir, bunShimRegex: RE, bundleRequire: cyclingRequire });
-  const ns = gc.bunfsRequire('/$bunfs/root/chunk-a.js');
-  check('mid-cycle require returns a deferring namespace, not a throw', typeof ns === 'object');
-  phase = 'done';
-  check('first property access performs the real require', ns.late === 99);
-  check('cycle proxy resolves the SAME virtual path', seen.every((x) => x === '/$bunfs/root/chunk-a.js'));
-  check('subsequent access is memoized', (() => { const n0 = seen.length; void ns.late; return seen.length === n0; })());
+  let ns = null;
+  try { ns = gc.bunfsRequire('/$bunfs/root/chunk-a.js'); } catch (_) { /* Checks unten werden namentlich rot */ }
+  check('js require returns a namespace without evaluating', ns !== null && seen.length === 0);
+  check('identity is stable across require calls', ns !== null && gc.bunfsRequire('/$bunfs/root/chunk-a.js') === ns);
+  check('mid-cycle property read yields undefined, no throw', ns !== null && ns.late === undefined);
+  check('mid-cycle shape comes from the static export clause', ns !== null && Object.keys(ns).includes('a'));
+  check('failure is not memoized: access after the cycle heals', ns !== null && (phase = 'done', ns.late === 99));
+  check('resolution is memoized afterwards', ns !== null && (() => { const n0 = seen.length; void ns.late; return seen.length === n0; })());
 }
 check('importing a .node as ESM is an error', throwsWith(() => load('file:///$bunfs/root/nat.node'), /native addon/));
 check('non-graph URL goes to nextLoad', load('file:///elsewhere/x.js') === NEXTL);
@@ -141,8 +143,8 @@ g.bunfsRequire('yaml');
 check('bare names pass through to bundleRequire', calls[1] === 'yaml');
 check('unknown graph paths are refused', throwsWith(() => g.bunfsRequire('/$bunfs/root/nope.node'), /not in the module graph/));
 check('file (derived): require returns the extracted path', g.bunfsRequire('/$bunfs/root/x.asset') === path.join(dir, 'x.asset'));
-check('js: require routes bundleRequire at the VIRTUAL path (require(esm) via hooks)', (() => { calls.length = 0; g.bunfsRequire('/$bunfs/root/chunk-a.js'); return calls[0] === '/$bunfs/root/chunk-a.js'; })());
-check('js: a rewritten absolute path maps back to the virtual form', (() => { calls.length = 0; g.bunfsRequire(path.join(dir, 'chunk-a.js')); return calls[0] === '/$bunfs/root/chunk-a.js'; })());
+check('js: first property access requires at the VIRTUAL path', (() => { calls.length = 0; const nsj = g.bunfsRequire('/$bunfs/root/chunk-a.js'); if (calls.length !== 0) return false; void nsj.x; return calls[0] === '/$bunfs/root/chunk-a.js'; })());
+check('js: absolute and virtual spelling yield the SAME proxy', g.bunfsRequire(path.join(dir, 'chunk-a.js')) === g.bunfsRequire('/$bunfs/root/chunk-a.js'));
 
 const ldir = makeGraph([
   { path: '/$bunfs/root/cli', body: 'export const x=1;', loader: 'js' },

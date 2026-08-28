@@ -84,6 +84,8 @@ function createModuleGraphLoader({ modulesDir, bunShimRegex, bundleRequire }) {
   // routing them into Node's require dies in a SyntaxError at startup).
   // Rewritten string literals arrive here as absolute extracted paths, direct
   // graph references as /$bunfs/root/ names; both resolve to the same entry.
+  const jsProxies = new Map();
+  const staticExports = new Map();
   const bunfsRequire = (spec) => {
     let abs = null;
     if (typeof spec === 'string') {
@@ -101,45 +103,86 @@ function createModuleGraphLoader({ modulesDir, bunShimRegex, bundleRequire }) {
         case 'file': return abs;
         case 'napi': return bundleRequire(abs);
         case 'js': case undefined: {
-          // require() of a graph ES module (first real site: v2.1.250,
-          // import.meta.require("...chunk...").udsInboxShape). Bun's require
-          // returns the module namespace synchronously; Node's require(esm)
-          // does the same, and because module.registerHooks() intercepts CJS
-          // resolution too, requiring the VIRTUAL path routes through the
-          // same resolve/load hooks and the same module-map entry as import:
-          // measured instance-identical, single evaluation. The virtual form
-          // is essential: the extracted file also exists on disk, and a
-          // path-based require would parse the ESM source as CommonJS. A
-          // module with top-level await still throws (ERR_REQUIRE_ASYNC_
-          // MODULE), which is the same constraint Bun's require has.
-          // Hoisting these requires into static imports was tried and is
-          // WRONG: it reorders graph evaluation, and the bundle's esbuild
-          // lazy-init pattern depends on the require happening at its
-          // original position (measured: chunk-ttktdez6's top-level IIFE read
-          // an import that had not initialized yet). So the require stays
-          // in place; only the mid-cycle case needs help. Node refuses a
-          // require of a module currently evaluating in a cycle, where Bun
-          // hands out the not-yet-finished namespace whose bindings the
-          // call sites read LATER, inside functions (measured on all four
-          // 2.1.250 cycle sites: stored in a var, accessed after startup).
-          // A lazy proxy reproduces exactly that: the real require runs on
-          // first property access, by which time the cycle has completed.
-          // If code ever reads a binding while the cycle is STILL open, the
-          // deferred require throws the original error, loudly.
+          // Bun's require of a graph ES module returns its namespace,
+          // evaluating the module synchronously unless it sits in an active
+          // import cycle; then Bun hands out the not-yet-finished namespace
+          // whose var-bound exports read undefined until assigned. Node's
+          // require(esm) instead throws ERR_REQUIRE_CYCLE_MODULE, and
+          // 2.1.250 hits that in several shapes (top-level requires,
+          // immediate property reads, cycles reached transitively through a
+          // deferred require's subgraph). Two approaches are documented as
+          // measured-wrong: hoisting the literals into static imports
+          // reorders evaluation (breaks the esbuild lazy-init pattern), and
+          // a proxy covering only the direct-cycle case still dies when the
+          // deferred require links a subgraph touching an active cycle.
+          //
+          // So the js case always returns ONE stable lazy namespace proxy
+          // per module: evaluation happens on first property access (same
+          // sync semantics, shifted to first use); an access while a cycle
+          // is open yields undefined WITHOUT memoizing the failure, so later
+          // reads heal, exactly the live-binding behavior var-bound exports
+          // have under Bun; and the namespace SHAPE (ownKeys/has) comes
+          // statically from the source's export clause, so re-export
+          // copying works even mid-cycle.
           const virt = virtOfAbs.get(abs);
-          try {
-            return bundleRequire(virt);
-          } catch (err) {
-            if (err && err.code !== 'ERR_REQUIRE_CYCLE_MODULE') throw err;
-            let ns = null;
-            const resolve = () => (ns ??= bundleRequire(virt));
-            return new Proxy({}, {
-              get: (_, k) => (k === Symbol.toStringTag ? 'Module' : resolve()[k]),
-              has: (_, k) => k in resolve(),
-              ownKeys: () => Reflect.ownKeys(resolve()),
-              getOwnPropertyDescriptor: (_, k) => Reflect.getOwnPropertyDescriptor(resolve(), k),
-            });
-          }
+          let proxy = jsProxies.get(virt);
+          if (proxy !== undefined) return proxy;
+          let ns = null;
+          const tryResolve = () => {
+            if (ns !== null) return ns;
+            try { return (ns = bundleRequire(virt)); }
+            catch (err) {
+              if (err && err.code === 'ERR_REQUIRE_CYCLE_MODULE') return null;
+              throw err;
+            }
+          };
+          const staticKeys = () => {
+            let keys = staticExports.get(virt);
+            if (keys === undefined) {
+              const src = fs.readFileSync(abs, 'utf8');
+              keys = [];
+              const re = /export\{([^}]*)\}/g;
+              let m; let last = null;
+              while ((m = re.exec(src)) !== null) last = m[1];
+              if (last !== null) {
+                for (const part of last.split(',')) {
+                  const name = part.trim().split(/\s+as\s+/).pop();
+                  if (name) keys.push(name.trim());
+                }
+              }
+              if (/export\s+default\b/.test(src)) keys.push('default');
+              staticExports.set(virt, keys);
+            }
+            return keys;
+          };
+          proxy = new Proxy({ __proto__: null }, {
+            get: (_, k) => {
+              if (k === Symbol.toStringTag) return 'Module';
+              const r = tryResolve();
+              return r === null ? undefined : r[k];
+            },
+            has: (_, k) => {
+              const r = tryResolve();
+              return r === null ? staticKeys().includes(k) : (k in r);
+            },
+            ownKeys: () => {
+              const r = tryResolve();
+              return r === null ? staticKeys().slice() : Reflect.ownKeys(r);
+            },
+            getOwnPropertyDescriptor: (_, k) => {
+              const r = tryResolve();
+              if (r === null) {
+                return staticKeys().includes(k)
+                  ? { configurable: true, enumerable: true, value: undefined }
+                  : undefined;
+              }
+              const d = Reflect.getOwnPropertyDescriptor(r, k);
+              if (d) d.configurable = true;
+              return d;
+            },
+          });
+          jsProxies.set(virt, proxy);
+          return proxy;
         }
         default:
           throw new Error(`[modulegraph] unknown loader ${JSON.stringify(ld)} for ${spec}`);
