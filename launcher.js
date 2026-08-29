@@ -10,6 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const Module = require('module');
 const os = require('os');
+const zlib = require('zlib');
 
 // Force system /usr/bin/rg — the bundle's default path resolution ends up at
 // a build-time-baked /home/runner/work/... path that doesn't exist here.
@@ -918,6 +919,16 @@ globalThis.__bunShim = {
     throw new Error('Bun.connect not supported under Node');
   },
 
+  // Embedded text assets ship zstd-compressed since v2.1.251 (magic-byte
+  // check at the call site, passthrough otherwise; .toString("utf8") on the
+  // result, so the Buffer node:zlib returns fits Bun's Uint8Array contract).
+  // Real implementations, not stubs: cheap, well-defined, and node:zlib has
+  // native zstd. The async form matches Bun's Promise<Uint8Array> shape.
+  zstdDecompressSync: (data) => zlib.zstdDecompressSync(data),
+  zstdDecompress: (data) => new Promise((resolve, reject) => {
+    zlib.zstdDecompress(data, (err, out) => (err ? reject(err) : resolve(out)));
+  }),
+
   build: () => {
     // Bun's bundler API (v2.1.247/248): bundles a plugin's hooks module
     // (hooks.ts) at runtime, feature itself rollout-gated. The only call site
@@ -949,7 +960,7 @@ globalThis.__bunShim = {
 //     ones, because membership short-circuits before any context inspection.
 // The loader applies this per module at load time (modulegraph-loader.js);
 // test/lockstep.test.js reads the alternation from this literal.
-const BUN_SHIM_RE = /(?<!["'`])(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve|connect|build|ant)\b/g;
+const BUN_SHIM_RE = /(?<!["'`])(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve|connect|build|zstdDecompressSync|zstdDecompress|ant)\b/g;
 
 // --- module graph loader -----------------------------------------------------
 // Shape check before anything runs: a damaged or absent manifest fails here

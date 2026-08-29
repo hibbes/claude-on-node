@@ -185,6 +185,18 @@ check('Bun.which returns null when PATH excludes the command', () => {
   return out === 'null';
 });
 
+// --- 7c. zstd roundtrip (real node:zlib implementations) -----------------------
+check('Bun.zstdDecompressSync roundtrips', () => {
+  const out = probe(`const z=require('zlib');const c=z.zstdCompressSync(Buffer.from('klaus-zstd'));` +
+    `console.log(Bun.zstdDecompressSync(c).toString('utf8'))`);
+  return out === 'klaus-zstd';
+});
+check('Bun.zstdDecompress (async) roundtrips', () => {
+  const out = probe(`const z=require('zlib');const c=z.zstdCompressSync(Buffer.from('klaus-async'));` +
+    `Bun.zstdDecompress(c).then((b)=>console.log(b.toString('utf8')))`);
+  return out === 'klaus-async';
+});
+
 // --- 8. Bun.ant members exist and throw on call -------------------------------
 
 check('Bun.ant.getPeerUid throws', () => {
