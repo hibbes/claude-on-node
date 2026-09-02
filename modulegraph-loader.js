@@ -251,4 +251,53 @@ function createModuleGraphLoader({ modulesDir, bunShimRegex, bundleRequire }) {
   };
 }
 
-module.exports = { createModuleGraphLoader, toSafe, BUNFS, BUNFS_URL, INDEX_FORMAT };
+// --- require(esm) mid-cycle tolerance -----------------------------------------
+// 2.1.258 captures VALUES at module top level in the tool registry chunk:
+//   wLn = import.meta.require("/$bunfs/root/chunk-<artifact>.js").ArtifactTool
+// while that chunk statically imports the registry chunk back (same shape
+// for Workflow, Monitor, ProposeSkills and EndConversation). Bun's
+// require(esm) evaluates the target right there, against the registry's
+// still-in-flight namespace (ordinary cyclic-evaluation semantics), so the
+// tool object exists. Node refuses to even LINK a synchronous require graph
+// that touches a module currently evaluating (#checkCachedJobForRequireESM
+// in internal/modules/esm/loader: "Cannot import Module X in a cycle"), the
+// lazy proxy above hands out undefined, and a captured undefined never heals:
+// five tools vanish from the registry and startup dies with "Cannot read
+// properties of undefined (reading 'name')".
+//
+// The refusal is Node policy, not a V8 limit: handed the in-flight job as the
+// dependency, V8 links and evaluates the required module against the partial
+// namespace exactly as it does inside a static-import cycle (measured:
+// bindings the in-flight module assigned before the require are visible,
+// later ones read undefined, same as under Bun). The private check cannot be
+// reached, so the public getOrCreateModuleJob() is wrapped: on precisely that
+// error the cached job is returned instead. "Cannot require() ES Module X in
+// a cycle" (the target ITSELF is evaluating) keeps throwing, the proxy above
+// covers it. The loader class is only reachable with --expose-internals,
+// which NODE_OPTIONS refuses, so launcher.js re-executes itself with the
+// flag; without it this returns false and the pre-2.1.258 behaviour stays.
+function installRequireCycleTolerance() {
+  let esm;
+  try { esm = require('internal/modules/esm/loader'); } catch (_) { return false; }
+  const proto = Object.getPrototypeOf(esm.getOrInitializeCascadedLoader());
+  const orig = proto.getOrCreateModuleJob;
+  if (typeof orig !== 'function') return false;
+  if (orig.cycleTolerant === true) return true;
+  const patched = function getOrCreateModuleJob(parentURL, request, requestType) {
+    try {
+      return orig.call(this, parentURL, request, requestType);
+    } catch (err) {
+      if (!(err && err.code === 'ERR_REQUIRE_CYCLE_MODULE' && /^Cannot import Module /.test(err.message))) throw err;
+      const { url } = this.resolveSync(parentURL, request);
+      const type = request && request.attributes ? request.attributes.type : undefined;
+      const job = this.loadCache.get(url, type) || this.loadCache.get(url, undefined) || this.loadCache.get(url, '');
+      if (!job) throw err;
+      return job;
+    }
+  };
+  patched.cycleTolerant = true;
+  proto.getOrCreateModuleJob = patched;
+  return true;
+}
+
+module.exports = { createModuleGraphLoader, installRequireCycleTolerance, toSafe, BUNFS, BUNFS_URL, INDEX_FORMAT };

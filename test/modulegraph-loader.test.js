@@ -208,6 +208,38 @@ const cycChild = spawnSync(process.execPath, ['-e', `
 check('e2e: require inside a genuine import cycle resolves via hoisted import', cycChild.status === 0 && cycChild.stdout.trim() === 'CYC:7');
 if (cycChild.status !== 0) console.error('  cycle child:', cycChild.stderr.trim().split('\n')[0]);
 
+// 2.1.258-Konstellation: cap-a (das Tool-Register) faengt am Modul-Top-Level
+// einen WERT ein: tool = import.meta.require(cap-b).Tool, waehrend cap-b
+// cap-a statisch zurueck-importiert. Ohne Toleranz weigert sich Node, cap-b
+// zu linken (cap-a evaluiert gerade), der Proxy liefert undefined und der
+// eingefangene Wert heilt nie. Mit installRequireCycleTolerance() unter
+// --expose-internals evaluiert cap-b gegen den halbfertigen cap-a wie unter
+// Bun: das Tool existiert, und cap-b sieht die vor dem require zugewiesene
+// Bindung von cap-a (early), waehrend die spaetere (late) noch undefined ist.
+const cap = makeGraph([
+  { path: '/$bunfs/root/cli', body: 'import{tool,seen}from"/$bunfs/root/cap-a.js";export const v=(tool&&tool.name)+":"+seen();' },
+  { path: '/$bunfs/root/cap-a.js', body: 'export var early="E";export var tool=import.meta.require("/$bunfs/root/cap-b.js").Tool;export var late="L";export const seen=()=>tool?tool.peek():"none";' },
+  { path: '/$bunfs/root/cap-b.js', body: 'import{early,late}from"/$bunfs/root/cap-a.js";const e=early,l=late;export const Tool={name:"Artifact",peek:()=>e+"/"+l};' },
+], '/$bunfs/root/cli');
+const capScript = `
+  const Module = require('module');
+  const { createModuleGraphLoader, installRequireCycleTolerance } = require(${JSON.stringify(path.join(REPO, 'modulegraph-loader.js'))});
+  const bundleRequire = Module.createRequire(${JSON.stringify(path.join(REPO, 'package.json'))});
+  const g = createModuleGraphLoader({ modulesDir: ${JSON.stringify(cap)}, bunShimRegex: ${RE.toString()}, bundleRequire });
+  const installed = installRequireCycleTolerance();
+  globalThis.__bunfsRequire = g.bunfsRequire;
+  Module.registerHooks(g.hooks);
+  import(g.entryUrl).then((m) => console.log('CAP:' + installed + ':' + m.v)).catch((e) => { console.error(e.code || e.message); process.exit(1); });
+`;
+const capTolerant = spawnSync(process.execPath, ['--expose-internals', '-e', capScript], { encoding: 'utf8', timeout: 20000 });
+check('e2e: top-level value capture across a require cycle sees the tool (2.1.258 shape, --expose-internals)',
+  capTolerant.status === 0 && capTolerant.stdout.trim() === 'CAP:true:Artifact:E/undefined');
+if (capTolerant.status !== 0) console.error('  cap tolerant child:', capTolerant.stderr.trim().split('\n')[0]);
+const capPlain = spawnSync(process.execPath, ['-e', capScript], { encoding: 'utf8', timeout: 20000 });
+check('e2e: without --expose-internals the installer reports false and the capture stays undefined',
+  capPlain.status === 0 && capPlain.stdout.trim() === 'CAP:false:undefined:none');
+if (capPlain.status !== 0) console.error('  cap plain child:', capPlain.stderr.trim().split('\n')[0]);
+
 const child = spawnSync(process.execPath, ['-e', `
   const Module = require('module');
   const { createModuleGraphLoader } = require(${JSON.stringify(path.join(REPO, 'modulegraph-loader.js'))});

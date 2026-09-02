@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Run Claude Code 2.1.250's module graph under Node (no Bun needed).
+// Run Claude Code 2.1.258's module graph under Node (no Bun needed).
 // Since v2.1.242/243 a release is a Bun standalone module graph (~1400 ESM
 // modules addressed as /$bunfs/root/<name>), which extract-modulegraph.py
 // unpacks into modules/ and modulegraph-loader.js serves to Node's ESM loader
@@ -967,7 +967,37 @@ const BUN_SHIM_RE = /(?<!["'`])(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal
 // with the directory named, instead of deep inside a chunk with a message
 // that names a minified identifier and nothing else (the single-bundle era's
 // issue #1, same failure direction).
-const { createModuleGraphLoader } = require('./modulegraph-loader.js');
+const { createModuleGraphLoader, installRequireCycleTolerance } = require('./modulegraph-loader.js');
+// Bun-faithful require(esm) inside import cycles (see the function's comment
+// in modulegraph-loader.js; 2.1.258 needs it for five tools) is only possible
+// with Node's internal ESM loader in reach, i.e. under --expose-internals.
+// NODE_OPTIONS rejects that flag, so when it is missing this process re-runs
+// itself with it and mirrors the child's exit. The wrapper on PATH can pass
+// the flag up front to skip the extra process (~1 s on the CPUs in question).
+// Signals from the terminal reach the child directly (same process group);
+// the parent only has to survive them until the child is done.
+if (!installRequireCycleTolerance()) {
+  if (process.env.CLAUDE_NODE_NO_REEXEC === '1') {
+    console.error('claude-on-node: --expose-internals is not effective; continuing without require-cycle tolerance');
+  } else {
+    const { spawnSync } = require('child_process');
+    for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']) process.on(sig, () => {});
+    const child = spawnSync(
+      process.execPath,
+      ['--expose-internals', ...process.execArgv, __filename, ...process.argv.slice(2)],
+      { stdio: 'inherit', env: { ...process.env, CLAUDE_NODE_NO_REEXEC: '1' } },
+    );
+    if (child.error) {
+      console.error(`claude-on-node: re-exec with --expose-internals failed: ${child.error.message}`);
+      process.exit(1);
+    }
+    if (child.signal) {
+      process.removeAllListeners(child.signal);
+      process.kill(process.pid, child.signal);
+    }
+    process.exit(child.status === null ? 1 : child.status);
+  }
+}
 let graph;
 try {
   graph = createModuleGraphLoader({ modulesDir, bunShimRegex: BUN_SHIM_RE, bundleRequire });
