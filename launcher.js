@@ -900,6 +900,19 @@ globalThis.__bunShim = {
       throw new Error('Bun.Transpiler not supported under Node');
     }
   },
+  // Bun's built-in image processor (v2.1.266), a sharp-compatible chaining API
+  // (new Bun.Image(buf).resize().jpeg()/.png().toBuffer()/.metadata()). Sole
+  // call site is the image-attach / clipboard-paste compression pipeline,
+  // reached lazily via an async loader (h8() -> new Bun.Image); nothing at
+  // startup or in non-image use touches it. A real shim would mean sharp, a
+  // heavy native libvips dep that risks SIGILL on this pre-POPCNT CPU, so per
+  // the stub-until-it-fires policy it throws for now; if image attachment is
+  // wanted here, back it with sharp (its API already matches the call sites).
+  Image: class {
+    constructor() {
+      throw new Error('Bun.Image not supported under Node (image attach/paste needs the native binary or a sharp-backed shim)');
+    }
+  },
   listen: () => {
     throw new Error('Bun.listen not supported under Node');
   },
@@ -960,7 +973,7 @@ globalThis.__bunShim = {
 //     ones, because membership short-circuits before any context inspection.
 // The loader applies this per module at load time (modulegraph-loader.js);
 // test/lockstep.test.js reads the alternation from this literal.
-const BUN_SHIM_RE = /(?<!["'`])(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve|connect|build|zstdDecompressSync|zstdDecompress|ant)\b/g;
+const BUN_SHIM_RE = /(?<!["'`])(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve|connect|build|zstdDecompressSync|zstdDecompress|Image|ant)\b/g;
 
 // --- module graph loader -----------------------------------------------------
 // Shape check before anything runs: a damaged or absent manifest fails here

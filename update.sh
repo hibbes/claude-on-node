@@ -363,7 +363,7 @@ SHIMMED_BUN=(
     Bun.gc Bun.embeddedFiles Bun.JSONL Bun.isStandaloneExecutable
     # Throws on first use (rare paths: REPL, heap-dump, agent-proxy relay, gateway):
     Bun.generateHeapSnapshot Bun.Transpiler Bun.listen Bun.serve Bun.connect
-    Bun.build
+    Bun.build Bun.Image
     # Anthropic-private native namespace (Proxy; members audited separately below):
     Bun.ant
 )

@@ -197,6 +197,12 @@ check('Bun.zstdDecompress (async) roundtrips', () => {
   return out === 'klaus-async';
 });
 
+// --- 7d. Bun.Image is a throwing constructor (image attach needs native/sharp)
+check('new Bun.Image() throws', () => {
+  const out = probe(`try { new Bun.Image(Buffer.from([0])); console.log("no throw"); } catch(e) { console.log("threw"); }`);
+  return out === 'threw';
+});
+
 // --- 8. Bun.ant members exist and throw on call -------------------------------
 
 check('Bun.ant.getPeerUid throws', () => {
