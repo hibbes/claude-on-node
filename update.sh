@@ -378,9 +378,22 @@ SHIMMED_BUN=(
 # of the symbol to sit inside that fingerprint, so a future *executable* use —
 # or just a reworded template — diverges the counts and re-trips the audit
 # instead of being silently waved through.
-#   Bun.stdin — v2.1.141, inside $p5()'s on-session-start.ts hook-handler template
+#   Bun.stdin — the .text() form new Response(Bun.stdin.stream()).text() sits in
+#   $p5()'s on-session-start.ts hook-handler template (inert, emitted verbatim)
+#   and in the VS-Code-only `claude edit-hook` path (executable but unreached
+#   under this Node deployment; tolerated here as before). Its executable reader
+#   form Bun.stdin.stream().getReader() (new in v2.1.269) is instead shimmed by a
+#   dedicated source-replace in launcher.js (BUN_STDIN_RE -> __bunShimStdin) and
+#   recorded in AUDIT_DEDICATED_BUN below.
 declare -A AUDIT_INERT_BUN=(
     [Bun.stdin]='new Response(Bun.stdin.stream()).text()'
+)
+# Bun.* symbols shimmed by a DEDICATED source-replace in launcher.js (not the
+# general BUN_SHIM_RE alternation, which would also rewrite the inert .text()
+# template above). Maps the symbol to the exact executable expression rewritten;
+# the audit counts these toward "handled" alongside any inert fingerprint.
+declare -A AUDIT_DEDICATED_BUN=(
+    [Bun.stdin]='Bun.stdin.stream().getReader()'
 )
 mapfile -t BUN_HITS < <(
 python3 - "$AUDIT_SRC" <<'PY'
@@ -400,32 +413,42 @@ PY
 )
 NEW_BUN=()
 INERT_BUN=()
+DEDICATED_BUN=()
 for h in "${BUN_HITS[@]}"; do
-    # Already redirected by launcher.js's source-replace shim.
+    # Already redirected by launcher.js's general source-replace shim.
     if printf '%s\n' "${SHIMMED_BUN[@]}" | grep -qxF "$h"; then
         continue
     fi
-    # Symbol verified-inert (string-literal content only)? Accept only when
-    # EVERY occurrence sits inside its recorded context fingerprint; otherwise
-    # a new or executable use has appeared, so fall through to NEW_BUN and re-flag.
-    if [[ -n "${AUDIT_INERT_BUN[$h]+set}" ]]; then
-        fp="${AUDIT_INERT_BUN[$h]}"
+    # Handled if EVERY occurrence sits inside a recorded context: the inert
+    # string-literal fingerprint (AUDIT_INERT_BUN) and/or the dedicated
+    # source-replace fingerprint (AUDIT_DEDICATED_BUN). We require the symbol
+    # count to equal the SUM of both, so a new or reworded form diverges the
+    # total and falls through to NEW_BUN instead of being waved through.
+    inert_fp="${AUDIT_INERT_BUN[$h]:-}"
+    ded_fp="${AUDIT_DEDICATED_BUN[$h]:-}"
+    if [[ -n "$inert_fp" || -n "$ded_fp" ]]; then
         set +e
         sym_n=$(grep -oF -- "$h" "$AUDIT_SRC" | wc -l)
-        fp_n=$(grep -oF -- "$fp" "$AUDIT_SRC" | wc -l)
+        inert_n=0; [[ -n "$inert_fp" ]] && inert_n=$(grep -oF -- "$inert_fp" "$AUDIT_SRC" | wc -l)
+        ded_n=0;   [[ -n "$ded_fp"   ]] && ded_n=$(grep -oF -- "$ded_fp"   "$AUDIT_SRC" | wc -l)
         set -e
-        if [[ "$fp_n" -gt 0 && "$sym_n" -eq "$fp_n" ]]; then
-            INERT_BUN+=("$h")
+        handled=$(( inert_n + ded_n ))
+        if [[ "$handled" -gt 0 && "$sym_n" -eq "$handled" ]]; then
+            [[ "$inert_n" -gt 0 ]] && INERT_BUN+=("$h")
+            [[ "$ded_n"   -gt 0 ]] && DEDICATED_BUN+=("$h")
             continue
         fi
-        warn "$h was classified inert but no longer matches its recorded context"
-        warn "  expected all ${sym_n} occurrence(s) inside: ${fp}"
-        warn "  matched ${fp_n} — inspect the bundle and update AUDIT_INERT_BUN"
+        warn "$h was classified handled but its occurrences no longer match"
+        warn "  total ${sym_n}: inert(${inert_fp:-none})=${inert_n} + dedicated(${ded_fp:-none})=${ded_n}"
+        warn "  inspect the bundle and update AUDIT_INERT_BUN / AUDIT_DEDICATED_BUN"
     fi
     NEW_BUN+=("$h")
 done
 if [[ ${#INERT_BUN[@]} -gt 0 ]]; then
     log "  note: ${INERT_BUN[*]} present only as inert string-literal content (not executed)"
+fi
+if [[ ${#DEDICATED_BUN[@]} -gt 0 ]]; then
+    log "  note: ${DEDICATED_BUN[*]} shimmed via a dedicated source-replace (see launcher.js BUN_STDIN_RE)"
 fi
 if [[ ${#NEW_BUN[@]} -gt 0 ]]; then
     warn "NEW unguarded Bun.* call sites: ${NEW_BUN[*]}"

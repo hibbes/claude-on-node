@@ -958,6 +958,20 @@ globalThis.__bunShim = {
   ant: _bunShim_ant,
 };
 
+// Bun.stdin is a BunFile over the process's own stdin. It is deliberately kept
+// OFF globalThis.__bunShim (and out of BUN_SHIM_RE below), so the four-way
+// lockstep that treats it as not-generically-shimmed stays intact: its .text()
+// form appears inside an inert plugin-scaffolding template (and the VS-Code-only
+// `claude edit-hook` path), which the alternation's blind text substitution
+// would corrupt. Only the executable reader form Bun.stdin.stream().getReader()
+// (v2.1.269's bounded stdin reader) is rewritten, via the dedicated BUN_STDIN_RE.
+// --- Bun.stdin shim (dedicated: executable reader form only; see BUN_STDIN_RE) ---
+globalThis.__bunShimStdin = {
+  // Web ReadableStream<Uint8Array> over process stdin, matching Bun.stdin.stream().
+  stream() { return require('stream').Readable.toWeb(process.stdin); },
+};
+// --- end Bun.stdin shim ---------------------------------------------------------
+
 // Source-replace every shimmed symbol. The lookbehind rules out two things:
 //   - identifiers ending in "Bun" (none in the bundle today, but cheap
 //     insurance against future minifier collisions), and
@@ -974,6 +988,12 @@ globalThis.__bunShim = {
 // The loader applies this per module at load time (modulegraph-loader.js);
 // test/lockstep.test.js reads the alternation from this literal.
 const BUN_SHIM_RE = /(?<!["'`])(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve|connect|build|zstdDecompressSync|zstdDecompress|Image|ant)\b/g;
+
+// Dedicated Bun.stdin rewrite (see the __bunShimStdin comment above). Scoped to
+// the single executable form so the inert .text() template is emitted verbatim;
+// the loader applies it after BUN_SHIM_RE. update.sh's audit counts this
+// getReader form as handled (AUDIT_DEDICATED_BUN) beside the inert .text() form.
+const BUN_STDIN_RE = /Bun\.stdin\.stream\(\)\.getReader\(\)/g;
 
 // --- module graph loader -----------------------------------------------------
 // Shape check before anything runs: a damaged or absent manifest fails here
@@ -1013,7 +1033,7 @@ if (!installRequireCycleTolerance()) {
 }
 let graph;
 try {
-  graph = createModuleGraphLoader({ modulesDir, bunShimRegex: BUN_SHIM_RE, bundleRequire });
+  graph = createModuleGraphLoader({ modulesDir, bunShimRegex: BUN_SHIM_RE, bunStdinRegex: BUN_STDIN_RE, bundleRequire });
 } catch (err) {
   console.error(
     `modules/ is not an intact Claude Code module graph (${modulesDir}).\n` +

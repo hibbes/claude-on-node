@@ -40,9 +40,12 @@ const INDEX_FORMAT = 1;
 // Module names may contain '/', the extractor flattens them to '__'.
 const toSafe = (rel) => rel.replace(/\//g, '__');
 
-function createModuleGraphLoader({ modulesDir, bunShimRegex, bundleRequire }) {
+function createModuleGraphLoader({ modulesDir, bunShimRegex, bunStdinRegex, bundleRequire }) {
   if (!(bunShimRegex instanceof RegExp) || !bunShimRegex.global) {
     throw new Error('bunShimRegex must be a global RegExp');
+  }
+  if (bunStdinRegex !== undefined && (!(bunStdinRegex instanceof RegExp) || !bunStdinRegex.global)) {
+    throw new Error('bunStdinRegex must be a global RegExp when provided');
   }
   if (typeof bundleRequire !== 'function') throw new Error('bundleRequire must be a function');
   const indexPath = path.join(modulesDir, '_index.json');
@@ -193,6 +196,9 @@ function createModuleGraphLoader({ modulesDir, bunShimRegex, bundleRequire }) {
 
   const rewrite = (source) => {
     let s = source.replace(bunShimRegex, '__bunShim.$1');
+    // Dedicated Bun.stdin rewrite: only the executable reader form, so the inert
+    // .text() plugin template (which shares the "Bun.stdin" text) is untouched.
+    if (bunStdinRegex) s = s.replace(bunStdinRegex, 'globalThis.__bunShimStdin.stream().getReader()');
     s = s.replace(/import\.meta\.require\b/g, 'globalThis.__bunfsRequire');
     for (const [virt, abs] of assets) {
       if (s.includes(virt)) s = s.split(virt).join(abs);
