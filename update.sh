@@ -535,10 +535,13 @@ log "  ✓ all backers resolvable ($(echo $BACKERS | tr '\n' ' '))"
 # Bun.file and Bun.TOML semantics). They do not depend on the release being
 # fetched, so running them here means a launcher.js that was hand-edited into an
 # inconsistent state blocks the deploy instead of shipping. Fail-safe: aborting
-# leaves the working version in place.
+# leaves the working version in place. The time limit matters since Bun.sleepSync
+# is a real blocking sleep: a regression that hands Atomics.wait a NaN blocks
+# forever, which would stall the unattended nightly run instead of failing it.
+# timeout signals the whole process group, so the blocked suite dies with npm.
 if [[ -d "$CLAUDE_NODE_DIR/test" ]]; then
     log "Running shim test suites…"
-    if ! (cd "$CLAUDE_NODE_DIR" && npm test >/dev/null 2>&1); then
+    if ! (cd "$CLAUDE_NODE_DIR" && timeout -k 10 300 npm test >/dev/null 2>&1); then
         warn "❌ Shim test suites failed — refusing to deploy over a broken launcher."
         warn "   Reproduce with: cd $CLAUDE_NODE_DIR && npm test"
         die "Update aborted. Nothing was changed."
