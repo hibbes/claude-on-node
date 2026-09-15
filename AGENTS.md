@@ -48,6 +48,15 @@ infer from the code, plus the traps that have actually bitten.
    lazily; a session keeps reading the directory it resolved at startup.
    `update.sh` moves an existing directory aside (`*.replaced-*`) rather than
    overwriting it, and rotation skips the live target. Keep it that way.
+10. **`Bun.ant.CellSegmenter` is not a shim candidate.** Since v2.1.271 the
+    Ink renderer constructs it whenever it builds an output buffer (the cell
+    painter behind `paint`/`segment`/`setCell` over the packed screen buffer)
+    and has no JS fallback. A throws-stub in `_bunShim_antMembers`, the usual
+    move for a new `Bun.ant` member, would pass the member audit and both
+    smoke probes (`--version`/`--help` never render) and then crash every
+    interactive session on its first frame. Releases that need it stay
+    blocked by the audit until the owner decides between a host that runs the
+    native binary and a full reimplementation.
 
 ## Editing rules
 
