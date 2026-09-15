@@ -81,6 +81,8 @@ const bundlePath = path.join(modulesDir, '_index.json');
 //     Bun.stringWidth               -> string-width@4 (ASCII fast path + memo cache)
 //     Bun.stripANSI                 -> strip-ansi@6
 //     Bun.wrapAnsi                  -> wrap-ansi@7
+//     Bun.sliceAnsi                 -> hand-rolled column slicer (widths via the stringWidth shim)
+//     Bun.sleepSync                 -> Atomics.wait
 //     Bun.which                     -> which@3
 //     Bun.hash                      -> 64-bit FNV-1a (BigInt; matches .toString() shape)
 //     Bun.deepEquals                -> hand-rolled deep-equality (Bun expect().toEqual non-strict)
@@ -780,6 +782,704 @@ function _bunShim_makeStringWidth(delegate, limits) {
 const _bunShim_stringWidth = _bunShim_makeStringWidth(bundleRequire('string-width'));
 // --- end Bun.stringWidth shim -------------------------------------------------
 
+// --- Bun.sleepSync shim (Atomics.wait on a private SharedArrayBuffer cell) ----
+// 2.1.271's only call site pauses 2 ms per round of a bounded loop that drains
+// pending terminal replies from /dev/tty. Without a real pause that loop spins
+// through its read budget at once and gives up before slow replies arrive.
+// Atomics.wait on a cell nobody ever notifies is a blocking sleep, and Node
+// allows it on the main thread. Validation follows Bun (its docs, its
+// sleepSync.test.ts and its source): the argument must be a number (a missing
+// one is undefined, so that throws too), extra arguments are ignored, and the
+// value is converted like Bun's coerce::<i32>, not like `| 0`: NaN becomes 0,
+// fractions truncate toward zero, and out-of-range values saturate at the
+// int32 limits instead of wrapping. Hence -Infinity throws as negative, and
+// NaN never reaches Atomics.wait, which would read it as "wait forever".
+const _bunShim_sleepCell = new Int32Array(new SharedArrayBuffer(4));
+function _bunShim_sleepSync(ms) {
+  if (typeof ms !== 'number') {
+    throw new TypeError(`Bun.sleepSync: "milliseconds" must be a number, got ${typeof ms}`);
+  }
+  const n = ms !== ms ? 0 : Math.max(-2147483648, Math.min(2147483647, Math.trunc(ms)));
+  if (n < 0) throw new TypeError(`argument to sleepSync must not be negative, got ${n}`);
+  Atomics.wait(_bunShim_sleepCell, 0, 0, n);
+}
+// --- end Bun.sleepSync shim ---------------------------------------------------
+
+// --- Bun.sliceAnsi shim (column slicing, SGR/OSC 8 aware, grapheme clusters) --
+// 2.1.271 replaced its bundled JS slicing helper with the native Bun.sliceAnsi,
+// and all five call sites sit on the interactive render path: the
+// truncate-with-ellipsis helper for Ink text, the renderer's horizontal clip,
+// and the collapsed-output wrapper. A stub would crash the UI, so this is a
+// full implementation of the documented contract (bun.com/reference/bun/
+// sliceAnsi and SliceAnsiOptions, Bun v1.3.11 release notes):
+//   - indices are terminal columns, `end` exclusive, negative ones count from
+//     the end, clamped like String.prototype.slice;
+//   - grapheme clusters are never split: a cluster goes in whole when its
+//     START column lies in [start, end), so a wide one may overhang `end` by a
+//     column (the call sites shrink `end` until the measured width fits);
+//   - SGR styles active at the cut are re-opened (one sequence per attribute)
+//     and closed at the end, OSC 8 hyperlinks likewise, other control
+//     sequences are invisible, and escapes past the end pass only when they
+//     close something that is open without opening anything;
+//   - an ellipsis (4th argument string, or {ellipsis}) marks a cut edge, counts
+//     against the width budget, and sits inside active SGR but outside an
+//     active hyperlink.
+// The edge cases (zero-width clusters at either boundary, the speculative zone
+// that decides whether an end ellipsis is needed, the bare ellipsis for a
+// degenerate range) follow Bun's own suite test/js/bun/util/sliceAnsi.test.ts,
+// which test/sliceansi-shim.test.js ports.
+//
+// Widths: every cluster is measured with the Bun.stringWidth shim above
+// (string-width@4), NOT with Bun's tables. The call sites measure with
+// Bun.stringWidth and then slice, so the two have to agree cluster by cluster,
+// or the shrink-to-fit loops and the chunked wrapper drift. Where string-width@4
+// and Bun disagree (U+200B, a lone regional indicator) or where Bun has a mode
+// the delegate lacks (ambiguousIsNarrow:false), this shim follows the delegate;
+// the suite's KNOWN LIMIT cases pin that.
+//
+// Work is bounded by the slice, not the input: tokenizing and grapheme
+// segmentation run lazily over growing windows, so cutting 80 columns off the
+// front of a multi-MB tool-output line touches a few hundred characters. That
+// is the input class that once froze Ink rendering through stringWidth.
+// Negative indices and an open end need the whole input, as they do in Bun.
+const _SA_TEXT = 0;
+const _SA_SGR = 1;
+const _SA_LINK = 2;
+const _SA_CTRL = 3;
+
+const _sa_isIntroducer = (c) => c === 0x1b || c === 0x9b || c === 0x9d || c === 0x90
+  || c === 0x98 || c === 0x9e || c === 0x9f || c === 0x9c;
+
+// OSC 8 hyperlink: ESC ] 8 ; params ; URI, then BEL, ESC \ or C1 ST; also with
+// the C1 OSC introducer. An empty URI is a close. ESC (other than in ESC \),
+// CAN or SUB inside aborts it; the generic control-string parser takes over.
+function _sa_parseLink(s, i) {
+  const n = s.length;
+  const esc = s.charCodeAt(i) === 0x1b;
+  let p;
+  if (esc) {
+    if (s.charCodeAt(i + 1) !== 0x5d || s.charCodeAt(i + 2) !== 0x38 || s.charCodeAt(i + 3) !== 0x3b) return null;
+    p = i + 4;
+  } else {
+    if (s.charCodeAt(i + 1) !== 0x38 || s.charCodeAt(i + 2) !== 0x3b) return null;
+    p = i + 3;
+  }
+  for (; p < n; p++) {
+    const d = s.charCodeAt(p);
+    if (d === 0x3b) break;
+    if (d === 0x07 || d === 0x9c || d === 0x1b || d === 0x18 || d === 0x1a) return null;
+  }
+  if (p >= n) return null;
+  const uri = p + 1;
+  for (let q = uri; q < n; q++) {
+    const d = s.charCodeAt(q);
+    let b = -1;
+    let term = '';
+    if (d === 0x07) { b = q + 1; term = '\x07'; }
+    else if (d === 0x1b && s.charCodeAt(q + 1) === 0x5c) { b = q + 2; term = '\x1b\\'; }
+    else if (d === 0x9c) { b = q + 1; term = '\x9c'; }
+    else if (d === 0x1b || d === 0x18 || d === 0x1a) return null;
+    if (b !== -1) {
+      return { t: _SA_LINK, a: i, b, open: q > uri, closePrefix: esc ? '\x1b]8;;' : '\x9d8;;', term };
+    }
+  }
+  return null;
+}
+
+// Control strings: OSC (ESC ] or C1, BEL or ST terminated), DCS/SOS/PM/APC (ST
+// terminated) and a standalone ST. An unterminated one is not consumed: its
+// introducer then counts as an invisible character and the text after it stays
+// visible. Returns the end index, or -1.
+function _sa_parseControlString(s, i) {
+  const n = s.length;
+  const c = s.charCodeAt(i);
+  let p;
+  let bel = false;
+  if (c === 0x1b) {
+    const d = s.charCodeAt(i + 1);
+    if (d === 0x5d) { p = i + 2; bel = true; }
+    else if (d === 0x50 || d === 0x58 || d === 0x5e || d === 0x5f) p = i + 2;
+    else if (d === 0x5c) return i + 2;
+    else return -1;
+  } else if (c === 0x9d) { p = i + 1; bel = true; }
+  else if (c === 0x90 || c === 0x98 || c === 0x9e || c === 0x9f) p = i + 1;
+  else if (c === 0x9c) return i + 1;
+  else return -1;
+  for (; p < n; p++) {
+    const d = s.charCodeAt(p);
+    if (bel && d === 0x07) return p + 1;
+    if (d === 0x1b) return s.charCodeAt(p + 1) === 0x5c ? p + 2 : p; // ST, or ESC aborts (kept)
+    if (d === 0x18 || d === 0x1a || d === 0x9c) return p + 1;
+  }
+  return -1;
+}
+
+// CSI: ESC [ or C1 0x9b, parameter bytes 0x30-0x3f, intermediates 0x20-0x2f,
+// final byte 0x40-0x7e. Only an `m` with digit/;/: parameters is SGR; anything
+// else is an invisible control. CAN, SUB and C1 ST abort it (consumed), ESC
+// aborts it (left for the next token), other bytes are payload, and an
+// unterminated CSI runs to the end of the input.
+function _sa_parseCsi(s, i) {
+  const n = s.length;
+  let p;
+  if (s.charCodeAt(i) === 0x1b) {
+    if (s.charCodeAt(i + 1) !== 0x5b) return null;
+    p = i + 2;
+  } else {
+    p = i + 1;
+  }
+  let canonical = true;
+  for (; p < n; p++) {
+    const d = s.charCodeAt(p);
+    if (d >= 0x40 && d <= 0x7e) return { t: d === 0x6d && canonical ? _SA_SGR : _SA_CTRL, a: i, b: p + 1 };
+    if (d >= 0x30 && d <= 0x3f) { if (d >= 0x3c) canonical = false; continue; }
+    if (d >= 0x20 && d <= 0x2f) { canonical = false; continue; }
+    if (d === 0x18 || d === 0x1a || d === 0x9c) return { t: _SA_CTRL, a: i, b: p + 1 };
+    if (d === 0x1b) return { t: _SA_CTRL, a: i, b: p };
+    canonical = false;
+  }
+  return { t: _SA_CTRL, a: i, b: n };
+}
+
+// Two-byte escapes (ESC 7, ESC c, ESC =) and nF sequences (ESC ( B, ESC # 8).
+// Returns -1 when the ESC starts none of them; it is then a lone invisible char.
+function _sa_parseEscape(s, i) {
+  const n = s.length;
+  let p = i + 1;
+  if (p === n) return n;
+  const c = s.charCodeAt(p);
+  if (c === 0x1b) return p;
+  if (c === 0x5b || c === 0x5d || c === 0x50 || c === 0x58 || c === 0x5e || c === 0x5f) return -1;
+  if (c >= 0x20 && c <= 0x2f) {
+    p++;
+    if (p === n) return n;
+    return s.charCodeAt(p) === 0x1b ? p : p + 1;
+  }
+  return c >= 0x30 && c <= 0x7e ? p + 1 : -1;
+}
+
+function _sa_parseAnsi(s, i) {
+  const c = s.charCodeAt(i);
+  if (c === 0x1b || c === 0x9d) {
+    const link = _sa_parseLink(s, i);
+    if (link) return link;
+  }
+  if (c !== 0x9b) {
+    const b = _sa_parseControlString(s, i);
+    if (b !== -1) return { t: _SA_CTRL, a: i, b };
+  }
+  if (c === 0x1b || c === 0x9b) {
+    const csi = _sa_parseCsi(s, i);
+    if (csi) return csi;
+  }
+  if (c === 0x1b) {
+    const b = _sa_parseEscape(s, i);
+    if (b !== -1) return { t: _SA_CTRL, a: i, b };
+  }
+  return null;
+}
+
+// SGR open code -> the code that closes it; 0 = unknown, closed by a full reset.
+const _sa_sgrClose = (code) => {
+  if (code === 1 || code === 2) return 22;
+  if (code === 3 || code === 20) return 23;
+  if (code === 4 || code === 21) return 24;
+  if (code === 5 || code === 6) return 25;
+  if (code === 7) return 27;
+  if (code === 8) return 28;
+  if (code === 9) return 29;
+  if ((code >= 30 && code <= 38) || (code >= 90 && code <= 97)) return 39;
+  if ((code >= 40 && code <= 48) || (code >= 100 && code <= 107)) return 49;
+  if (code === 51 || code === 52) return 54;
+  if (code === 53) return 55;
+  if (code === 58) return 59;
+  if (code === 73 || code === 74) return 75;
+  return 0;
+};
+const _sa_isSgrClose = (code) => code === 0 || code === 22 || code === 23 || code === 24
+  || code === 25 || code === 27 || code === 28 || code === 29 || code === 39 || code === 49
+  || code === 54 || code === 55 || code === 59 || code === 75;
+// Attribute slot: styles in the same slot replace each other, different slots
+// stack. The slot is the close code, except where one close ends several
+// independent attributes (22 bold+dim, 23 italic+fraktur, 24 single+double
+// underline, 54 framed+encircled): those get one slot per open code.
+const _sa_sgrSlot = (code) => {
+  const close = _sa_sgrClose(code);
+  return close === 22 || close === 23 || close === 24 || close === 54 ? code : close;
+};
+
+// SGR parameters; an empty one is 0 (ECMA-48), so ESC[m is [0]. Colon
+// sub-parameters, or more than 32 parameters, make the sequence opaque: it is
+// then kept and closed as a whole instead of being decomposed.
+function _sa_sgrParams(s, tok) {
+  const c1 = s.charCodeAt(tok.a) === 0x9b;
+  const last = tok.b - 1; // the final `m`
+  const list = [];
+  let cur = 0;
+  let opaque = false;
+  for (let p = tok.a + (c1 ? 1 : 2); p < last; p++) {
+    const d = s.charCodeAt(p);
+    if (d >= 0x30 && d <= 0x39) {
+      if (cur < 100000) cur = cur * 10 + (d - 0x30);
+      continue;
+    }
+    if (d === 0x3a) opaque = true; // otherwise `;`: an SGR token holds nothing else
+    if (list.length >= 32) return { c1, list, opaque: true };
+    list.push(cur);
+    cur = 0;
+  }
+  if (list.length >= 32) return { c1, list, opaque: true };
+  list.push(cur);
+  return { c1, list, opaque };
+}
+
+// Active styles: an ordered list of { slot, open, close }. A new style removes
+// the entry in its slot and appends itself, so opens are re-emitted in the
+// order they last took effect.
+const _sa_startStyle = (styles, slot, open, close) => {
+  for (let k = styles.length - 1; k >= 0; k--) if (styles[k].slot === slot) styles.splice(k, 1);
+  styles.push({ slot, open, close });
+};
+const _sa_endStyle = (styles, close) => {
+  for (let k = styles.length - 1; k >= 0; k--) if (styles[k].close === close) styles.splice(k, 1);
+};
+
+function _sa_applySgr(styles, s, tok) {
+  const { c1, list, opaque } = _sa_sgrParams(s, tok);
+  if (opaque) {
+    const close = _sa_sgrClose(list[0]);
+    _sa_startStyle(styles, _sa_sgrSlot(list[0]), s.slice(tok.a, tok.b), close ? `\x1b[${close}m` : '\x1b[0m');
+    return;
+  }
+  const pre = c1 ? '\x9b' : '\x1b[';
+  for (let k = 0; k < list.length;) {
+    const code = list[k];
+    if (code === 0) {
+      styles.length = 0;
+      k++;
+    } else if (code === 38 || code === 48 || code === 58) { // extended fg / bg / underline colour
+      const close = `\x1b[${_sa_sgrClose(code)}m`;
+      if (list[k + 1] === 5 && k + 2 < list.length) {
+        _sa_startStyle(styles, _sa_sgrSlot(code), `${pre}${code};5;${list[k + 2]}m`, close);
+        k += 3;
+      } else if (list[k + 1] === 2 && k + 4 < list.length) {
+        _sa_startStyle(styles, _sa_sgrSlot(code), `${pre}${code};2;${list[k + 2]};${list[k + 3]};${list[k + 4]}m`, close);
+        k += 5;
+      } else {
+        _sa_startStyle(styles, _sa_sgrSlot(code), `${pre}${code}m`, close);
+        k++;
+      }
+    } else if (_sa_isSgrClose(code)) {
+      _sa_endStyle(styles, `\x1b[${code}m`);
+      k++;
+    } else {
+      const close = _sa_sgrClose(code);
+      _sa_startStyle(styles, _sa_sgrSlot(code), `${pre}${code}m`, close ? `\x1b[${close}m` : '\x1b[0m');
+      k++;
+    }
+  }
+}
+
+// Past the end, an SGR sequence is kept only if it closes an open style and
+// opens nothing (slice-ansi's behavior, which Bun keeps).
+function _sa_closesOnly(styles, s, tok) {
+  const { list, opaque } = _sa_sgrParams(s, tok);
+  if (opaque) return false;
+  let closes = false;
+  for (let k = 0; k < list.length; k++) {
+    const code = list[k];
+    if (code === 0) {
+      if (styles.length) closes = true;
+    } else if (_sa_isSgrClose(code)) {
+      const close = `\x1b[${code}m`;
+      if (styles.some((st) => st.close === close)) closes = true;
+    } else {
+      return false;
+    }
+  }
+  return closes;
+}
+
+// Cluster widths through the stringWidth shim (see above). Single code points,
+// by far the common case, are cached per code point (a lazily allocated table
+// holding width + 1), so even a long CJK line costs one delegate call per
+// distinct character; longer clusters go through a bounded memo.
+let _sa_cpWidths = null;
+const _sa_codePointWidth = (cp) => {
+  if (cp >= 0x20 && cp <= 0x7e) return 1;
+  _sa_cpWidths ??= new Uint8Array(0x110000);
+  let w = _sa_cpWidths[cp];
+  if (w === 0) {
+    w = _bunShim_stringWidth(String.fromCodePoint(cp)) + 1;
+    _sa_cpWidths[cp] = w;
+  }
+  return w - 1;
+};
+const _sa_widthMemo = new Map();
+const _sa_width = (str) => {
+  let w = _sa_widthMemo.get(str);
+  if (w === undefined) {
+    w = _bunShim_stringWidth(str);
+    if (str.length <= 32) {
+      if (_sa_widthMemo.size >= 4096) _sa_widthMemo.clear();
+      _sa_widthMemo.set(str, w);
+    }
+  }
+  return w;
+};
+const _sa_clusterWidth = (v, a, b) => {
+  const cp = v.codePointAt(a);
+  return b - a === (cp > 0xffff ? 2 : 1) ? _sa_codePointWidth(cp) : _sa_width(v.slice(a, b));
+};
+
+let _sa_segmenter = null;
+const _SA_REPLACEMENT = String.fromCharCode(0xfffd);
+const _SA_LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+// Characters that can join a neighbor into one grapheme cluster: CR (CR LF),
+// ZWJ, Extend (Grapheme_Extend, emoji modifiers, tag characters), SpacingMark
+// (Mc plus U+0E33/U+0EB3), Prepend, Hangul jamo, regional indicators. Visible
+// text without any of them is one cluster per code point, so Intl.Segmenter,
+// the dominant per-call cost on typical UI lines, can be skipped. JS regex has
+// no Prepend property, hence the explicit list; test/sliceansi-shim.test.js
+// checks the whole set against the running ICU over every assigned code point,
+// so joiners added by a future Unicode (16 brought U+113D1) turn the suite red
+// instead of splitting clusters.
+const _SA_JOINER = /[\r\u{200d}\u{e33}\u{eb3}\u{1100}-\u{11ff}\u{a960}-\u{a97f}\u{d7b0}-\u{d7ff}\u{600}-\u{605}\u{6dd}\u{70f}\u{890}\u{891}\u{8e2}\u{d4e}\u{110bd}\u{110cd}\u{111c2}\u{111c3}\u{113d1}\u{1193f}\u{11941}\u{11a3a}\u{11a84}-\u{11a89}\u{11d46}\u{11f02}\u{e0020}-\u{e007f}\p{Grapheme_Extend}\p{Mc}\p{Emoji_Modifier}\p{Regional_Indicator}]/u;
+
+// Lazy tokenizer. toks holds tokens in input order; text tokens carry their
+// offset into `vis`, the visible text seen so far (lone surrogates replaced by
+// U+FFFD, so two halves separated by an escape never pair up there); bound[i]
+// flags the start of a grapheme cluster in vis.
+function _sa_produce(sc, want) {
+  const { s } = sc;
+  const n = s.length;
+  const parts = [];
+  let visLen = sc.vis.length;
+  let p = sc.pos;
+  while (p < n && visLen < want) {
+    if (_sa_isIntroducer(s.charCodeAt(p))) {
+      const tok = _sa_parseAnsi(s, p);
+      if (tok) { sc.toks.push(tok); p = tok.b; continue; }
+    }
+    // Visible text up to the next introducer (an introducer that starts no
+    // sequence is visible itself), capped at what is still wanted, never
+    // splitting a surrogate pair.
+    const cap = Math.min(n, p + (want - visLen));
+    let q = p + 1;
+    while (q < cap && !_sa_isIntroducer(s.charCodeAt(q))) q++;
+    if (q < n && (s.charCodeAt(q - 1) & 0xfc00) === 0xd800 && (s.charCodeAt(q) & 0xfc00) === 0xdc00) q++;
+    sc.toks.push({ t: _SA_TEXT, a: p, b: q, v: visLen });
+    parts.push(s.slice(p, q).replace(_SA_LONE_SURROGATE, _SA_REPLACEMENT));
+    visLen += q - p;
+    p = q;
+  }
+  sc.pos = p;
+  sc.done = p >= n;
+  if (parts.length) sc.vis += parts.join('');
+  // Cluster starts for everything seen so far. A boundary depends only on the
+  // text before it and the character right after it (UAX #29 looks no further
+  // ahead), so flags the walk already acted on cannot change when more text
+  // arrives; recomputing from 0 keeps the code simple, and the doubling window
+  // keeps the total linear.
+  const v = sc.vis;
+  sc.ascii = /^[\x20-\x7e]*$/.test(v);
+  const bound = new Uint8Array(v.length);
+  if (sc.ascii) {
+    bound.fill(1);
+  } else if (!_SA_JOINER.test(v)) {
+    for (let i = 0; i < v.length; i++) { // one cluster per code point
+      bound[i] = 1;
+      if ((v.charCodeAt(i) & 0xfc00) === 0xd800) i++; // vis holds no lone surrogates
+    }
+  } else {
+    _sa_segmenter ??= new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+    for (const { index } of _sa_segmenter.segment(v)) bound[index] = 1;
+  }
+  sc.bound = bound;
+}
+
+const _sa_toInteger = (v) => {
+  const x = +v; // ToNumber: throws on Symbol/BigInt, as Bun's index conversion does
+  if (x !== x) return 0;
+  if (x === Infinity || x === -Infinity) return x;
+  return Math.trunc(x);
+};
+
+// String.prototype.slice-style resolution against a known total width.
+// Returns null for an empty range, else [start, end, cutStart, cutEnd].
+const _sa_bounds = (startD, endD, total) => {
+  let from = startD < 0 ? total + startD : startD;
+  let to = endD < 0 ? total + endD : endD;
+  if (from < 0) from = 0;
+  if (to > total) to = total;
+  if (!(to > from)) return null;
+  return [from, to, from > 0, to < total];
+};
+
+// The column walk. `end` === Infinity means "to the end of the input".
+// cutEndKnown/cutEndHint: whether it is already known that content lies past
+// `end` (negative-index path); otherwise that is discovered on the way.
+function _sa_walk(sc, start, end, ellipsis, ew, cutStartForEllipsis, cutEndKnown, cutEndHint) {
+  const { s } = sc;
+  const endUnbounded = end === Infinity;
+
+  const out = [];
+  let runA = -1;
+  let runB = -1;
+  const flushRun = () => { if (runA !== -1) { out.push(s.slice(runA, runB)); runA = -1; } };
+  const emitSrc = (a, b) => {
+    if (runA !== -1 && a === runB) runB = b;
+    else { flushRun(); runA = a; runB = b; }
+  };
+  const emitStr = (str) => { if (str) { flushRun(); out.push(str); } };
+
+  let styles = [];
+  let link = { active: false, code: '', closePrefix: '', term: '' };
+  const applyLink = (tok) => {
+    link = tok.open
+      ? { active: true, code: s.slice(tok.a, tok.b), closePrefix: tok.closePrefix, term: tok.term }
+      : { ...link, active: false };
+  };
+  // Escapes met after the first included cluster wait here until the next
+  // visible character shows whether they sit inside the slice (emit all) or
+  // past its end (emit only what closes something open).
+  let pending = [];
+  const flushPending = (closeOnly) => {
+    for (const tok of pending) {
+      if (tok.t === _SA_SGR) {
+        if (closeOnly && !_sa_closesOnly(styles, s, tok)) continue;
+        _sa_applySgr(styles, s, tok);
+        emitSrc(tok.a, tok.b);
+      } else if (tok.t === _SA_LINK) {
+        if (closeOnly && (tok.open || !link.active)) continue;
+        applyLink(tok);
+        emitSrc(tok.a, tok.b);
+      } else if (!closeOnly) {
+        emitSrc(tok.a, tok.b);
+      }
+    }
+    pending = [];
+  };
+
+  // Ellipsis budget. With the end cut still unknown, budget for it anyway and
+  // write the columns it would replace as a "speculative zone": if content
+  // turns up past the zone, the zone is dropped for the ellipsis; if the input
+  // ends first, the zone stays and no end ellipsis is added.
+  let needStartEllipsis = false;
+  let needEndEllipsis = false;
+  let endBudget = 0;
+  const startBeforeBudget = start;
+  if (ew > 0) {
+    if (cutStartForEllipsis && ew < end - start) { needStartEllipsis = true; start += ew; }
+    if (cutEndKnown && cutEndHint && ew < end - start) {
+      needEndEllipsis = true;
+      end -= ew;
+    } else if (!cutEndKnown && !endUnbounded && ew < end - start) {
+      needEndEllipsis = true;
+      endBudget = ew;
+      end -= ew;
+    }
+    if (cutEndKnown && (cutStartForEllipsis || cutEndHint) && !needStartEllipsis && !needEndEllipsis) {
+      return ellipsis; // a side is cut but the range cannot hold the ellipsis
+    }
+  }
+  const specEnd = end + endBudget;
+  let inZone = false;
+  let zoneMark = 0;
+  let zoneStyles = null;
+  let zoneLink = null;
+  const enterZone = () => {
+    if (inZone) return;
+    inZone = true;
+    flushRun();
+    zoneMark = out.length;
+    zoneStyles = styles.slice();
+    zoneLink = { ...link };
+  };
+
+  if (sc.toks.length === 0 && !sc.done) _sa_produce(sc, endUnbounded ? Infinity : 2 * specEnd + 64);
+  const clusterWidth = (a, b) => (sc.ascii ? b - a : _sa_clusterWidth(sc.vis, a, b));
+
+  let position = 0; // start column of the current cluster
+  let clusterStart = 0; // its offset in vis
+  let hasPrev = false;
+  let include = false;
+  let sawCutEnd = false;
+  let pastSpecEnd = false; // only zero-width clusters seen at specEnd so far
+  let stopped = false;
+  let ti = 0;
+  walk: for (;;) {
+    if (ti === sc.toks.length) {
+      if (sc.done) break;
+      _sa_produce(sc, Math.max(64, sc.vis.length * 2));
+      continue;
+    }
+    const tok = sc.toks[ti++];
+    if (tok.t !== _SA_TEXT) {
+      if (include) pending.push(tok);
+      else if (tok.t === _SA_SGR) _sa_applySgr(styles, s, tok);
+      else if (tok.t === _SA_LINK) applyLink(tok);
+      continue;
+    }
+    for (let k = tok.a; k < tok.b;) {
+      const len = (s.charCodeAt(k) & 0xfc00) === 0xd800 && k + 1 < tok.b
+        && (s.charCodeAt(k + 1) & 0xfc00) === 0xdc00 ? 2 : 1;
+      const vi = tok.v + (k - tok.a);
+      if (sc.bound[vi]) {
+        if (hasPrev) position += clusterWidth(clusterStart, vi);
+        if (!endUnbounded && position >= specEnd) {
+          // A cut needs visible width at or past specEnd. A zero-width cluster
+          // exactly at specEnd (LF, tab) is not one: keep scanning, emit
+          // nothing. Without an ellipsis the difference is unobservable.
+          if (ew === 0 || position > specEnd || _sa_codePointWidth(sc.vis.codePointAt(vi)) > 0) {
+            sawCutEnd = true;
+            flushPending(true);
+            stopped = true;
+            break walk;
+          }
+          pastSpecEnd = true;
+        } else {
+          if (!include && position >= start) {
+            include = true;
+            for (const st of styles) emitStr(st.open);
+            if (needStartEllipsis) emitStr(ellipsis);
+            if (link.active) emitStr(link.code);
+          }
+          if (include) {
+            flushPending(false);
+            if (!endUnbounded && position >= end && endBudget > 0) enterZone();
+            emitSrc(k, k + len);
+          }
+        }
+        clusterStart = vi;
+      } else if (include && !pastSpecEnd) { // continuation of the current cluster
+        flushPending(false);
+        emitSrc(k, k + len);
+      }
+      hasPrev = true;
+      k += len;
+    }
+  }
+
+  const lastClusterCol = position;
+  if (!stopped) {
+    if (hasPrev) position += clusterWidth(clusterStart, sc.vis.length);
+    // The last cluster may overhang specEnd (a wide one straddling it).
+    if (!endUnbounded && position > specEnd) sawCutEnd = true;
+  }
+  // Degenerate: something was cut but no room for the ellipsis next to content.
+  if (ew > 0 && (!include || (!needStartEllipsis && !needEndEllipsis))
+      && (sawCutEnd || (cutStartForEllipsis
+        && (position > startBeforeBudget || (hasPrev && lastClusterCol >= startBeforeBudget))))) {
+    return ellipsis;
+  }
+  if (!include) return '';
+  let discardedZone = false;
+  if (endBudget > 0) {
+    if (sawCutEnd) {
+      if (inZone) { // the cut is real: drop the zone, restore the state at its start
+        runA = -1;
+        out.length = zoneMark;
+        styles = zoneStyles;
+        link = zoneLink;
+        discardedZone = true;
+      }
+    } else {
+      needEndEllipsis = false; // no cut after all: the zone content stays
+    }
+  }
+  // Trailing escapes: close-only once the walk reached the end bound,
+  // unfiltered when the whole remainder fit.
+  if (!stopped && !discardedZone) flushPending(!endUnbounded && position >= specEnd);
+  if (link.active) emitStr(link.closePrefix + link.term);
+  if (needEndEllipsis) emitStr(ellipsis);
+  for (let k = styles.length - 1; k >= 0; k--) { // reverse order; a close shared by
+    const close = styles[k].close; //                several slots (22) goes out once
+    let dup = false;
+    for (let j = styles.length - 1; j > k; j--) if (styles[j].close === close) { dup = true; break; }
+    if (!dup) emitStr(close);
+  }
+  flushRun();
+  return out.join('');
+}
+
+function _bunShim_sliceAnsi(input, start, end, options, _ambiguousIsNarrow) {
+  const s = typeof input === 'string' ? input : `${input}`;
+  if (s.length === 0) return '';
+  const startD = start === undefined ? 0 : _sa_toInteger(start);
+  const endD = end === undefined ? Infinity : _sa_toInteger(end);
+  let ellipsis = '';
+  if (typeof options === 'string') {
+    ellipsis = options;
+  } else if (options !== null && (typeof options === 'object' || typeof options === 'function')) {
+    const e = options.ellipsis;
+    if (typeof e === 'string') ellipsis = e;
+    void options.ambiguousIsNarrow; // read like Bun does, so a throwing getter propagates
+  }
+  // ambiguousIsNarrow (boolean 4th argument, options key, or 5th argument) is
+  // accepted and has no effect: see the width note above (KNOWN LIMIT).
+  const ew = ellipsis === '' ? 0 : _bunShim_stringWidth(ellipsis);
+
+  // The whole input, no ellipsis: nothing to cut (Bun returns the input itself).
+  if (startD === 0 && endD === Infinity && ew === 0) return s;
+
+  // Printable-ASCII fast path: one column per code unit, no escapes. Taken for
+  // an all-ASCII input, and for a non-negative range that ends inside the
+  // input's printable-ASCII prefix (scanned only to two past `end`).
+  const scanTo = startD >= 0 && endD >= 0 && endD !== Infinity ? Math.min(s.length, endD + 2) : s.length;
+  let prefix = 0;
+  while (prefix < scanTo) {
+    const c = s.charCodeAt(prefix);
+    if (c < 0x20 || c > 0x7e) break;
+    prefix++;
+  }
+  const wholeAscii = scanTo === s.length && prefix === s.length;
+  if (wholeAscii || (startD >= 0 && endD >= 0 && endD < prefix)) {
+    const bounds = _sa_bounds(startD, endD, wholeAscii ? s.length : prefix);
+    if (bounds === null) return '';
+    let [st, en] = bounds;
+    const cutStart = bounds[2];
+    const cutEnd = wholeAscii ? bounds[3] : true;
+    if (!cutStart && !cutEnd) return s;
+    if (ew > 0) {
+      const doStart = cutStart && ew < en - st;
+      if (doStart) st += ew;
+      const doEnd = cutEnd && ew < en - st;
+      if (doEnd) en -= ew;
+      if (!doStart && !doEnd) return ellipsis;
+      return (doStart ? ellipsis : '') + s.slice(st, en) + (doEnd ? ellipsis : '');
+    }
+    return s.slice(st, en);
+  }
+
+  const sc = { s, toks: [], pos: 0, vis: '', bound: null, ascii: true, done: false };
+  if (startD >= 0 && endD >= 0) {
+    // Common case: no width pre-pass; whether `end` cuts anything is found on
+    // the way. Anything past twice the length is past any possible width.
+    if (startD === Infinity || startD > s.length * 2) return '';
+    if (endD === Infinity || endD > s.length * 2) {
+      return _sa_walk(sc, startD, Infinity, ellipsis, ew, startD > 0, true, false);
+    }
+    if (endD <= startD) return '';
+    return _sa_walk(sc, startD, endD, ellipsis, ew, startD > 0, false, false);
+  }
+  // A negative index needs the total width first.
+  _sa_produce(sc, Infinity);
+  let total = 0;
+  if (sc.ascii) {
+    total = sc.vis.length;
+  } else {
+    for (let a = 0, k = 1; k <= sc.vis.length; k++) {
+      if (k === sc.vis.length || sc.bound[k]) { total += _sa_clusterWidth(sc.vis, a, k); a = k; }
+    }
+  }
+  const bounds = _sa_bounds(startD, endD, total);
+  if (bounds === null) return '';
+  // No end cut: walk to EOF, so trailing zero-width clusters and escapes stay.
+  return _sa_walk(sc, bounds[0], bounds[3] ? bounds[1] : Infinity, ellipsis, ew, bounds[0] > 0, true, bounds[3]);
+}
+// --- end Bun.sliceAnsi shim ---------------------------------------------------
+
 // --- Bun.ant shim (Anthropic-private native namespace, throws per member) ----
 // v2.1.219 introduced `Bun.ant`, a namespace of Anthropic-private natives in
 // their custom Bun build. Every member sits at a call site that degrades
@@ -864,6 +1564,8 @@ globalThis.__bunShim = {
   stringWidth: _bunShim_stringWidth,
   stripANSI: (s) => stripAnsiMod(String(s ?? '')),
   wrapAnsi: (s, cols, opts) => wrapAnsiMod(String(s ?? ''), Number(cols) || 80, opts),
+  sliceAnsi: _bunShim_sliceAnsi,
+  sleepSync: _bunShim_sleepSync,
   which: (cmd, opts) => {
     // Bun.which options are {PATH, cwd}; npm which understands {path, pathExt}.
     // Passing PATH through unmapped is a silent landmine: which ignores the
@@ -987,7 +1689,7 @@ globalThis.__bunShimStdin = {
 //     ones, because membership short-circuits before any context inspection.
 // The loader applies this per module at load time (modulegraph-loader.js);
 // test/lockstep.test.js reads the alternation from this literal.
-const BUN_SHIM_RE = /(?<!["'`])(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve|connect|build|zstdDecompressSync|zstdDecompress|Image|ant)\b/g;
+const BUN_SHIM_RE = /(?<!["'`])(?<![A-Za-z0-9_$])Bun\.(YAML|TOML|semver|Terminal|spawn|stringWidth|stripANSI|wrapAnsi|sliceAnsi|sleepSync|which|hash|deepEquals|file|gc|embeddedFiles|JSONL|isStandaloneExecutable|generateHeapSnapshot|Transpiler|listen|serve|connect|build|zstdDecompressSync|zstdDecompress|Image|ant)\b/g;
 
 // Dedicated Bun.stdin rewrite (see the __bunShimStdin comment above). Scoped to
 // the single executable form so the inert .text() template is emitted verbatim;

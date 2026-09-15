@@ -72,7 +72,7 @@ Claude Code plugins spawn subprocesses with `bun run --cwd <plugin-dir>`. On mac
 
 ## Bun shim coverage
 
-All 26 symbols below are source-replaced in `launcher.js` (`Bun.X` → `__bunShim.X`) before the bundle is evaluated. The set must stay in lockstep with `SHIMMED_BUN` in `update.sh`, which the release audit checks against.
+All 28 symbols below are source-replaced in `launcher.js` (`Bun.X` → `__bunShim.X`) before the bundle is evaluated. The set must stay in lockstep with `SHIMMED_BUN` in `update.sh`, which the release audit checks against.
 
 **Real Node-equivalent implementations:**
 
@@ -86,6 +86,8 @@ All 26 symbols below are source-replaced in `launcher.js` (`Bun.X` → `__bunShi
 | `Bun.stringWidth` | `string-width` | ANSI-aware width for help/UI layout; printable-ASCII fast path plus bounded memo cache so multi-MB tool_results (base64 screenshots) cannot stall Ink rendering on slow CPUs |
 | `Bun.stripANSI` | `strip-ansi` | |
 | `Bun.wrapAnsi` | `wrap-ansi` | |
+| `Bun.sliceAnsi` | hand-rolled column slicer, cluster widths from the `Bun.stringWidth` shim | Since v2.1.271 the truncate-with-ellipsis helper, the renderer's horizontal clip and the collapsed-output wrapper, all on the render path. Implements [Bun's documented contract](https://bun.com/reference/bun/sliceAnsi): terminal columns, negative indices, grapheme clusters kept whole, SGR styles and OSC 8 hyperlinks re-opened and closed at the cut, `ellipsis`; edge cases calibrated against Bun's own test suite. Widths deliberately follow `string-width@4`, so slicing and measuring agree; where Bun's tables differ (U+200B, a lone regional indicator, ZWJ and variation selectors counted as columns, `ambiguousIsNarrow: false`) that is a KNOWN LIMIT pinned in the suite. Work is bounded by the slice, not the input, so a multi-MB tool-output line costs no more than a short one |
+| `Bun.sleepSync` | `Atomics.wait` | 2 ms pauses while draining pending terminal replies from `/dev/tty` (v2.1.271); argument validation as in Bun |
 | `Bun.which` | `which` | executable lookup |
 | `Bun.hash` | 64-bit FNV-1a (BigInt) | cache-key derivation; only `.toString()` shape is observed, so exact Wyhash parity isn't needed |
 | `Bun.zstdDecompress` / `Bun.zstdDecompressSync` | `node:zlib` native zstd | Real implementation; async form returns a Promise like Bun's. Embedded text assets ship zstd-compressed since v2.1.251. |
