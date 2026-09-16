@@ -54,9 +54,10 @@ infer from the code, plus the traps that have actually bitten.
     and has no JS fallback. A throws-stub in `_bunShim_antMembers`, the usual
     move for a new `Bun.ant` member, would pass the member audit and both
     smoke probes (`--version`/`--help` never render) and then crash every
-    interactive session on its first frame. Releases that need it stay
-    blocked by the audit until the owner decides between a host that runs the
-    native binary and a full reimplementation.
+    interactive session on its first frame. The owner ended the project at
+    Claude Code 2.1.270 (September 2026, see README), and `update.sh` refuses
+    this member even with `--force`. Do not add a stub; reimplementing the
+    class would be a new project decision, not a routine shim.
 
 ## Editing rules
 

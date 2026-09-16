@@ -1,5 +1,12 @@
 # claude-on-node
 
+> [!WARNING]
+> **End of the line: Claude Code 2.1.270 is the last release this project can run.**
+>
+> From 2.1.271 on, Claude Code's terminal renderer constructs `Bun.ant.CellSegmenter` whenever it builds an output buffer, and throws if the class is missing. It comes from Anthropic's internal Bun build, not from public Bun: it is undocumented, it paints the renderer's private screen-buffer format, and the bundle has no JavaScript fallback. A shim cannot stand in for it, and a stub would get past the release audit and both smoke probes, then fail as soon as the renderer builds its first output buffer. `update.sh` therefore refuses every release that needs it, even with `--force`.
+>
+> The last working state is tagged [`last-supported-2.1.270`](https://github.com/hibbes/claude-on-node/tree/last-supported-2.1.270); deploy that release with `claude-node-update 2.1.270`. It keeps working only as long as Anthropic's API accepts 2.1.270. On CPUs without AVX2/POPCNT, the way forward is running Claude Code on a machine that can execute the native binary.
+
 Run [Anthropic's Claude Code CLI](https://www.npmjs.com/package/@anthropic-ai/claude-code) under plain Node.js on machines where the official Bun-compiled binary won't boot — typically older x86_64 CPUs without AVX2/POPCNT (Core2Duo, early Nehalem) where Bun crashes with `SIGILL` on startup.
 
 ## What it does

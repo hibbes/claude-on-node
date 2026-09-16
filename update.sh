@@ -491,6 +491,14 @@ for m in "${ANT_HITS[@]}"; do
 done
 if [[ ${#NEW_ANT[@]} -gt 0 ]]; then
     warn "NEW Bun.ant members: ${NEW_ANT[*]}"
+    # Bun.ant.CellSegmenter (2.1.271+) is the renderer's native cell painter, with no
+    # JS fallback: no shim can work, and --force would deploy a release that passes
+    # both smoke probes but fails once the renderer builds an output buffer. The
+    # project ends at 2.1.270 (README, AGENTS.md rule 10), so this is refused outright.
+    if printf '%s\n' "${NEW_ANT[@]}" | grep -qxF 'Bun.ant.CellSegmenter'; then
+        warn "Bun.ant.CellSegmenter is the renderer's native cell painter and cannot be shimmed."
+        die "claude-on-node ends at Claude Code 2.1.270 (see README); --force does not override this. Stay on it: claude-node-update 2.1.270"
+    fi
     warn "Extend _bunShim_antMembers in launcher.js and ANT_MEMBERS here in"
     warn "lockstep (decide throw vs. real impl from the call site's fallback)."
     if [[ "$FORCE" -eq 0 ]]; then
